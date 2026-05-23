@@ -30,12 +30,6 @@ The tool performs verification using normal temporary files inside the selected 
 <img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
 <img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
 
-```md
-![Dashboard](docs/screenshots/dashboard.png)
-![Scan Controls](docs/screenshots/scan-controls.png)
-![Report](docs/screenshots/report.png)
-```
-
 ## Requirements
 
 - Windows 11 recommended
