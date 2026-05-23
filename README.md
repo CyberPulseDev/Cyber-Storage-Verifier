@@ -20,7 +20,6 @@ The tool performs verification using normal temporary files inside the selected 
 
 ## Screenshots
 
-Add screenshots here after uploading the project to GitHub:
 <img width="1352" height="882" alt="Screenshot 2026-05-23 205356" src="https://github.com/user-attachments/assets/35e97305-b8b6-49c6-989f-a6e64ea5ced7" />
 <img width="1354" height="854" alt="Screenshot 2026-05-23 205417" src="https://github.com/user-attachments/assets/29bed4bb-d173-495e-85cb-a85dcf6becfd" />
 <img width="1356" height="855" alt="Screenshot 2026-05-23 205420" src="https://github.com/user-attachments/assets/2f2ae115-aac2-4f95-9cbf-5b1e454dbe14" />
