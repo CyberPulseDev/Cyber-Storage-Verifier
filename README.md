@@ -1,6 +1,6 @@
 # Cyber Storage Verifier
 
-**Cyber Storage Verifier** is a Windows-focused Python desktop application for checking HDDs, SSDs, USB pendrives, SD cards, and external storage devices for counterfeit-capacity signs, unstable read/write behavior, metadata anomalies, and basic health indicators.
+**Cyber Storage Verifier** is a Windows-focused Python desktop application that checks HDDs, SSDs, USB flash drives, SD cards, and other external storage devices for counterfeit capacity indicators, unstable read/write behavior, metadata anomalies, and basic health indicators.
 
 The tool performs verification using normal temporary files inside the selected target folder. It does **not** write directly to raw disks.
 
@@ -21,6 +21,15 @@ The tool performs verification using normal temporary files inside the selected 
 ## Screenshots
 
 Add screenshots here after uploading the project to GitHub:
+<img width="1352" height="882" alt="Screenshot 2026-05-23 205356" src="https://github.com/user-attachments/assets/35e97305-b8b6-49c6-989f-a6e64ea5ced7" />
+<img width="1354" height="854" alt="Screenshot 2026-05-23 205417" src="https://github.com/user-attachments/assets/29bed4bb-d173-495e-85cb-a85dcf6becfd" />
+<img width="1356" height="855" alt="Screenshot 2026-05-23 205420" src="https://github.com/user-attachments/assets/2f2ae115-aac2-4f95-9cbf-5b1e454dbe14" />
+<img width="1356" height="855" alt="Screenshot 2026-05-23 205423" src="https://github.com/user-attachments/assets/51192301-7cf5-4def-827e-eacf7a5698c7" />
+<img width="1361" height="852" alt="Screenshot 2026-05-23 205426" src="https://github.com/user-attachments/assets/fdca21b8-ce74-4d9c-ad80-64e5f27ef4be" />
+<img width="1358" height="853" alt="Screenshot 2026-05-23 205429" src="https://github.com/user-attachments/assets/2ad2cac9-3a9f-42a6-86ec-3bfbdab49254" />
+<img width="1353" height="852" alt="Screenshot 2026-05-23 205433" src="https://github.com/user-attachments/assets/7918071d-6cdc-420a-9c5f-c1c0a0469a01" />
+<img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
+<img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
 
 ```md
 ![Dashboard](docs/screenshots/dashboard.png)
