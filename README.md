@@ -36,7 +36,7 @@ The tool performs verification using normal temporary files inside the selected 
 <img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
 <img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
 
-## Latest Improvements
+## Latest Improvements 24/05/2026
 
 The latest update significantly improves scan telemetry synchronization, corruption tracking, resumable recovery, and partial report generation while preserving the existing integrity validation engine and scan architecture.
 
