@@ -10,6 +10,12 @@ The tool performs verification using normal temporary files inside the selected 
 - Quick, balanced, deep, full-capacity, random spot, boundary, and health-only scan modes
 - Resumable block-based write/read verification
 - SHA-256 block integrity validation
+- Real-time processed, verified, corrupted, and failed block telemetry
+- Live corruption analytics and SHA-256 mismatch detection
+- Partial scan finalization with evidence preservation
+- Verified, corrupted, and failed block range analysis
+- Estimated authentic usable capacity detection
+- Consecutive corruption tracking and corruption boundary detection
 - Read/write speed measurement and speed-drop detection
 - Windows drive, volume, filesystem, and PowerShell metadata collection
 - Optional SMART summary support through `smartctl` from smartmontools
@@ -29,6 +35,77 @@ The tool performs verification using normal temporary files inside the selected 
 <img width="1353" height="852" alt="Screenshot 2026-05-23 205433" src="https://github.com/user-attachments/assets/7918071d-6cdc-420a-9c5f-c1c0a0469a01" />
 <img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
 <img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
+
+## Latest Improvements
+
+The latest update significantly improves scan telemetry synchronization, corruption tracking, resumable recovery, and partial report generation while preserving the existing integrity validation engine and scan architecture.
+
+### Added & Improved
+
+- Live recalculation of:
+  - Processed blocks
+  - Verified blocks
+  - Corrupted blocks
+  - Failed blocks
+  - Read failures
+  - Risk score
+  - Coverage percentage
+  - Current scan phase
+  - Current block tracking
+
+- Fixed verification progress behavior
+  - Processed progress now advances even during corruption
+  - Verified capacity only counts successful SHA-256 validated blocks
+  - Separate tracking for:
+    - Verified data
+    - Corrupted data
+    - Failed data
+    - Processed data
+
+- Added partial scan finalization
+  - Reports now generate even if scans are manually stopped
+  - Supports:
+    - Stop Scan
+    - Cancel
+    - Emergency Stop
+    - Severe corruption auto-stop
+  - Reports are marked:
+    - `SCAN INTERRUPTED - PARTIAL RESULTS`
+
+- Added advanced corruption intelligence
+  - First corruption block detection
+  - Corruption percentage analysis
+  - Consecutive corruption tracking
+  - Corruption start offset detection
+  - Estimated authentic usable capacity
+  - SHA-256 mismatch evidence
+  - Verified/corrupted/failed range mapping
+
+- Enhanced reporting engine
+  - TXT / JSON / CSV / HTML improvements
+  - Partial-session evidence preservation
+  - Corruption timelines
+  - SMART summaries
+  - Device metadata
+  - Interruption reasons
+  - Verified and failed range reporting
+
+- Added optional severe corruption auto-stop
+  - Automatically finalizes scans after configurable consecutive corruption thresholds
+  - Disabled by default
+  - Configurable from Settings
+
+- Improved Active Scan UI
+  - Warning banners
+  - Live corruption visualization
+  - Processed vs verified telemetry
+  - Stabilized ETA calculations
+  - Live findings updates
+
+- Improved resumable scan reliability
+  - Enhanced checkpoint synchronization
+  - Improved finalize() and finish_session() handling
+  - Better interrupted-session recovery
 
 ## Requirements
 
