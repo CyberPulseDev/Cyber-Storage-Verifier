@@ -409,6 +409,25 @@ class ScanResult:
     verified_blocks: int = 0
     failed_blocks: int = 0
     corrupted_blocks: int = 0
+    processed_blocks: int = 0
+    verified_bytes: int = 0
+    corrupted_bytes: int = 0
+    failed_bytes: int = 0
+    processed_bytes: int = 0
+    coverage_percent: float = 0.0
+    corruption_percent: float = 0.0
+    first_corruption_block: int = 0
+    first_failure_timestamp: str = ""
+    consecutive_corruption_count: int = 0
+    max_consecutive_corruption_count: int = 0
+    corruption_start_offset: int = 0
+    estimated_valid_capacity_bytes: int = 0
+    last_successful_block: int = 0
+    current_block_index: int = 0
+    current_phase: str = "Starting"
+    scan_interrupted: bool = False
+    interruption_reason: str = ""
+    finalization_reason: str = "completed"
     write_failures: int = 0
     read_failures: int = 0
     speed_drops: list = field(default_factory=list)
@@ -441,6 +460,8 @@ class ScannerSettings:
     enable_powershell_metadata: bool = True
     delayed_verify_seconds: int = 0
     random_recheck_percent: int = 8
+    auto_stop_severe_corruption: bool = False
+    severe_corruption_blocks: int = 100
 
 
 class Tooltip:
@@ -511,6 +532,7 @@ class StorageScanner:
         self.cancelled = False
         self.paused = False
         self.emergency_stop = False
+        self.stop_reason = ""
         self.session = {}
         self.blocks = []
         self.test_file = None
@@ -518,6 +540,7 @@ class StorageScanner:
 
     def cancel(self):
         self.cancelled = True
+        self.stop_reason = self.stop_reason or "manual cancellation"
 
     def pause(self):
         self.paused = True
@@ -528,6 +551,7 @@ class StorageScanner:
     def emergency(self):
         self.emergency_stop = True
         self.cancelled = True
+        self.stop_reason = "emergency stop"
 
     def wait_if_paused(self):
         while self.paused and not self.cancelled and not self.emergency_stop:
@@ -541,6 +565,92 @@ class StorageScanner:
         self.log(f"[{severity}] {title}: {detail}")
         if severity in ("Critical", "High"):
             result.fake_capacity_indicators.append(title)
+
+    def has_issue(self, result: ScanResult, title: str) -> bool:
+        return any(getattr(issue, "title", "") == title for issue in result.issues)
+
+    def refresh_result_counts(self, result: ScanResult):
+        written = [b for b in self.blocks if b.write_status == "written"]
+        ok = [b for b in self.blocks if b.verification_result == "ok"]
+        corrupt = [b for b in self.blocks if b.verification_result == "corrupt"]
+        read_failed = [b for b in self.blocks if b.verification_result == "read_failed"]
+        write_failed = [b for b in self.blocks if b.write_status == "failed"]
+        failed = corrupt + read_failed + write_failed
+        processed = [b for b in self.blocks if b.verification_result in ("ok", "corrupt", "read_failed") or b.write_status == "failed"]
+
+        result.blocks_tested = len(written)
+        result.verified_blocks = len(ok)
+        result.corrupted_blocks = len(corrupt)
+        result.failed_blocks = len(failed)
+        result.write_failures = len(write_failed)
+        result.read_failures = len(read_failed)
+        result.processed_blocks = len(processed)
+        result.verified_bytes = sum(b.size for b in ok)
+        result.corrupted_bytes = sum(b.size for b in corrupt)
+        result.failed_bytes = sum(b.size for b in failed)
+        result.processed_bytes = sum(b.size for b in processed)
+        result.coverage_percent = (result.processed_bytes / max(1, result.capacity_reported_bytes)) * 100 if result.capacity_reported_bytes else 0.0
+        result.corruption_percent = (result.corrupted_bytes / max(1, result.processed_bytes)) * 100 if result.processed_bytes else 0.0
+
+        first_failure = min(failed, key=lambda b: b.index, default=None)
+        first_corrupt = min(corrupt, key=lambda b: b.index, default=None)
+        last_ok = max(ok, key=lambda b: b.index, default=None)
+        result.first_corruption_block = first_corrupt.index + 1 if first_corrupt else 0
+        result.corruption_start_offset = first_corrupt.offset if first_corrupt else 0
+        result.estimated_valid_capacity_bytes = first_corrupt.offset if first_corrupt else result.verified_bytes
+        result.first_failure_timestamp = first_failure.timestamp if first_failure else ""
+        result.last_successful_block = last_ok.index + 1 if last_ok else 0
+
+        current_run = 0
+        max_run = 0
+        for block in sorted(self.blocks, key=lambda b: b.index):
+            if block.verification_result == "corrupt":
+                current_run += 1
+                max_run = max(max_run, current_run)
+            elif block.verification_result in ("ok", "read_failed") or block.write_status == "failed":
+                current_run = 0
+        result.consecutive_corruption_count = current_run
+        result.max_consecutive_corruption_count = max_run
+
+    def emit_telemetry(self, result: ScanResult, phase: str, block: BlockRecord = None, extra=None):
+        self.refresh_result_counts(result)
+        if block:
+            result.current_block_index = block.index + 1
+        result.current_phase = phase
+        metrics = {
+            "phase": phase,
+            "block": result.current_block_index,
+            "total_blocks": result.total_blocks,
+            "verified_blocks": result.verified_blocks,
+            "failed_blocks": result.failed_blocks,
+            "corrupted_blocks": result.corrupted_blocks,
+            "read_failures": result.read_failures,
+            "write_failures": result.write_failures,
+            "risk_score": min(100, max(0, result.risk_score)),
+            "coverage_percent": result.coverage_percent,
+            "test_coverage_percent": (result.test_size_bytes / max(1, result.capacity_reported_bytes)) * 100 if result.capacity_reported_bytes else 0.0,
+            "verified_bytes": result.verified_bytes,
+            "corrupted_bytes": result.corrupted_bytes,
+            "failed_bytes": result.failed_bytes,
+            "processed_bytes": result.processed_bytes,
+            "test_size_bytes": result.test_size_bytes,
+            "corruption_percent": result.corruption_percent,
+            "first_corruption_block": result.first_corruption_block,
+            "consecutive_corruption_count": result.consecutive_corruption_count,
+            "estimated_valid_capacity_bytes": result.estimated_valid_capacity_bytes,
+        }
+        if block:
+            metrics["current_offset"] = block.offset
+            metrics["block_size"] = block.size
+        if extra:
+            metrics.update(extra)
+        self.metric(metrics)
+
+    def mark_interrupted(self, result: ScanResult, reason: str):
+        result.scan_interrupted = True
+        result.interruption_reason = reason
+        result.finalization_reason = reason
+        self.stop_reason = self.stop_reason or reason
 
     def run(self) -> ScanResult:
         result = ScanResult(root=self.root, scan_mode=self.scan_mode, flush_policy=self.flush_policy)
@@ -612,11 +722,17 @@ class StorageScanner:
 
         except Exception as exc:
             self.add_issue(result, "Critical", "Scanner exception", f"{type(exc).__name__}: {exc}", 40)
+            result.finalization_reason = "scanner exception"
             self.log(traceback.format_exc())
             self.logger.exception("Scanner exception")
         finally:
-            self.finish_session(result)
-        return self.finalize(result)
+            if self.cancelled and not result.scan_interrupted:
+                self.mark_interrupted(result, self.stop_reason or "manual cancellation")
+            if self.blocks:
+                self.refresh_result_counts(result)
+        final_result = self.finalize(result)
+        self.finish_session(final_result)
+        return final_result
 
     def evaluate_advertised_capacity(self, result):
         diff = result.advertised_bytes - result.capacity_reported_bytes
@@ -890,6 +1006,8 @@ class StorageScanner:
                 return True
             except Exception as exc:
                 last_exc = exc
+                if self.emergency_stop or self.cancelled:
+                    break
                 time.sleep(self.settings.retry_delay_sec)
         block.error_details = f"{type(last_exc).__name__}: {last_exc}"
         return False
@@ -901,30 +1019,38 @@ class StorageScanner:
         mode = "r+b" if self.test_file.exists() else "w+b"
         written_bytes = sum(b.size for b in self.blocks if b.write_status == "written" and not self.recheck_all)
         verified_bytes = sum(b.size for b in self.blocks if b.verification_result == "ok" and not self.recheck_all)
+        processed_bytes = sum(b.size for b in self.blocks if b.verification_result in ("ok", "corrupt", "read_failed") or b.write_status == "failed")
         write_speeds = []
         read_speeds = []
+        write_started = time.perf_counter()
+        verify_started = None
+        total_plan_bytes = sum(b.size for b in self.blocks)
 
         with open(self.test_file, mode, buffering=1024 * 1024) as fh:
             for block in self.blocks:
                 self.wait_if_paused()
                 if self.cancelled:
-                    self.log("Scan stopped. Session checkpoint was preserved for resume.")
+                    self.mark_interrupted(result, self.stop_reason or "manual cancellation")
+                    self.log("Scan stopped. Session checkpoint was preserved for resume and partial reports.")
                     break
                 if block.write_status == "written" and block.expected_sha256 and not self.recheck_all:
                     continue
                 ok = self.retry_io(lambda b=block: self.write_block(fh, b), block)
                 if not ok:
                     block.write_status = "failed"
-                    result.write_failures += 1
+                    self.refresh_result_counts(result)
                     self.log(f"[High] Write failure at block {block.index + 1}: {block.error_details}")
                     self.save_checkpoint()
+                    self.emit_telemetry(result, "Writing", block, {"write_speed": 0.0})
                     continue
                 written_bytes += block.size
                 write_speeds.append(block.write_speed_mb_s)
                 self.save_checkpoint()
                 pct = 23 + int((written_bytes / max(1, result.test_size_bytes)) * 34)
                 self.progress(min(57, pct))
-                self.metric({"phase": "Writing", "write_speed": block.write_speed_mb_s, "block": block.index + 1})
+                elapsed = max(time.perf_counter() - write_started, 0.001)
+                eta = ((total_plan_bytes - written_bytes) / max(1, written_bytes)) * elapsed if written_bytes else 0
+                self.emit_telemetry(result, "Writing", block, {"write_speed": block.write_speed_mb_s, "eta_seconds": eta})
                 if block.index % 4 == 0 or block.index == len(self.blocks) - 1:
                     self.log(f"Written {human_bytes(written_bytes)} / {human_bytes(result.test_size_bytes)}")
 
@@ -948,10 +1074,12 @@ class StorageScanner:
                 verify_plan = sorted(random.sample(verify_plan, min(sample, len(verify_plan))), key=lambda b: b.index)
 
             self.log("Starting read verification phase.")
+            verify_started = time.perf_counter()
             for block in verify_plan:
                 self.wait_if_paused()
                 if self.cancelled:
-                    self.log("Scan stopped. Session checkpoint was preserved for resume.")
+                    self.mark_interrupted(result, self.stop_reason or "manual cancellation")
+                    self.log("Scan stopped. Session checkpoint was preserved for resume and partial reports.")
                     break
                 if block.verification_result == "ok" and not self.recheck_all:
                     continue
@@ -959,26 +1087,48 @@ class StorageScanner:
                 if not ok:
                     block.read_status = "failed"
                     block.verification_result = "read_failed"
-                    result.read_failures += 1
+                    self.refresh_result_counts(result)
                     self.log(f"[High] Read failure at block {block.index + 1}: {block.error_details}")
                 elif block.verification_result == "corrupt":
-                    result.corrupted_blocks += 1
+                    if not self.has_issue(result, "Data corruption detected"):
+                        self.add_issue(
+                            result,
+                            "Critical",
+                            "Data corruption detected",
+                            "One or more blocks changed after writing. This is a strong counterfeit/failing-device signal.",
+                            60,
+                        )
+                    self.refresh_result_counts(result)
                     self.log(f"[Critical] Data corruption detected at block {block.index + 1}")
                 else:
                     verified_bytes += block.size
                     read_speeds.append(block.read_speed_mb_s)
+                    self.refresh_result_counts(result)
+                processed_bytes = result.processed_bytes
                 self.save_checkpoint()
-                pct = 57 + int((verified_bytes / max(1, result.test_size_bytes)) * 31)
+                pct = 57 + int((processed_bytes / max(1, result.test_size_bytes)) * 31)
                 self.progress(min(88, pct))
-                self.metric({"phase": "Verifying", "read_speed": block.read_speed_mb_s, "block": block.index + 1})
+                elapsed = max(time.perf_counter() - verify_started, 0.001)
+                eta = ((result.test_size_bytes - processed_bytes) / max(1, processed_bytes)) * elapsed if processed_bytes else 0
+                self.emit_telemetry(result, "Verifying", block, {"read_speed": block.read_speed_mb_s, "eta_seconds": eta})
                 if block.index % 4 == 0 or block.index == verify_plan[-1].index:
-                    self.log(f"Verified {human_bytes(verified_bytes)} / {human_bytes(result.test_size_bytes)}")
+                    self.log(
+                        f"Verified {human_bytes(result.verified_bytes)} | "
+                        f"Corrupted {human_bytes(result.corrupted_bytes)} | "
+                        f"Processed {human_bytes(result.processed_bytes)} / {human_bytes(result.test_size_bytes)}"
+                    )
+                if (
+                    self.settings.auto_stop_severe_corruption
+                    and result.max_consecutive_corruption_count >= self.settings.severe_corruption_blocks
+                ):
+                    self.mark_interrupted(result, f"corruption threshold exceeded ({result.max_consecutive_corruption_count} consecutive blocks)")
+                    self.cancelled = True
+                    self.log(f"[Critical] Auto-stopping after {result.max_consecutive_corruption_count} consecutive corrupted blocks.")
+                    break
 
             self.random_recheck(fh, result, read_speeds)
 
-        result.blocks_tested = len([b for b in self.blocks if b.write_status == "written"])
-        result.verified_blocks = len([b for b in self.blocks if b.verification_result == "ok"])
-        result.failed_blocks = len([b for b in self.blocks if b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed"])
+        self.refresh_result_counts(result)
         if write_speeds:
             result.write_mb_s = sum(write_speeds) / len(write_speeds)
         else:
@@ -988,9 +1138,9 @@ class StorageScanner:
         result.read_mb_s = sum(all_read) / len(all_read) if all_read else 0
         self.detect_speed_anomalies(result)
 
-        if result.write_failures:
+        if result.write_failures and not self.has_issue(result, "Write failure detected"):
             self.add_issue(result, "High", "Write failure detected", "The device failed during temporary test data writing.", 32)
-        if result.corrupted_blocks:
+        if result.corrupted_blocks and not self.has_issue(result, "Data corruption detected"):
             self.add_issue(
                 result,
                 "Critical",
@@ -998,7 +1148,7 @@ class StorageScanner:
                 f"{result.corrupted_blocks} block(s) changed after writing. This is a strong counterfeit/failing-device signal.",
                 60,
             )
-        if result.read_failures:
+        if result.read_failures and not self.has_issue(result, "Read failure detected"):
             self.add_issue(
                 result,
                 "High",
@@ -1021,13 +1171,22 @@ class StorageScanner:
             if self.retry_io(lambda b=block: self.read_verify_block(fh, b), block):
                 read_speeds.append(block.read_speed_mb_s)
                 if block.verification_result != "ok":
-                    result.corrupted_blocks += 1
+                    self.refresh_result_counts(result)
+                    if not self.has_issue(result, "Data corruption detected"):
+                        self.add_issue(
+                            result,
+                            "Critical",
+                            "Data corruption detected",
+                            "One or more blocks changed after writing. This is a strong counterfeit/failing-device signal.",
+                            60,
+                        )
                     self.log(f"[Critical] Random recheck failed at block {block.index + 1}")
             else:
                 block.verification_result = "read_failed"
-                result.read_failures += 1
+                self.refresh_result_counts(result)
             if previous != block.verification_result:
                 self.save_checkpoint()
+                self.emit_telemetry(result, "Random Recheck", block, {"read_speed": block.read_speed_mb_s})
 
     def detect_speed_anomalies(self, result):
         speeds = [(b.offset, b.write_speed_mb_s, "write") for b in self.blocks if b.write_speed_mb_s > 0]
@@ -1121,22 +1280,40 @@ class StorageScanner:
     def finish_session(self, result):
         if not self.session:
             return
-        self.session["status"] = "completed" if not self.cancelled and not result.failed_blocks else "active"
+        if result.scan_interrupted:
+            session_status = "interrupted"
+        elif result.failed_blocks:
+            session_status = "completed_with_findings"
+        else:
+            session_status = "completed"
+        self.session["status"] = session_status
         self.session["result_status"] = result.status
+        self.session["finalization_reason"] = result.finalization_reason
+        self.session["interruption_reason"] = result.interruption_reason
+        self.session["report_path"] = result.report_path
+        self.session["json_report_path"] = result.json_report_path
+        self.session["csv_report_path"] = result.csv_report_path
+        self.session["html_report_path"] = result.html_report_path
         try:
             self.save_checkpoint()
             self.write_session_block_csv(Path(self.session["session_dir"]) / BLOCK_REPORT_NAME)
             if self.cancelled:
-                self.log("Resume mode active: unfinished test files were preserved.")
+                self.log("Resume mode active: unfinished test files were preserved and partial reports were generated.")
         except Exception as exc:
             self.log(f"[Warning] Could not update session checkpoint: {exc}")
 
     def finalize(self, result: ScanResult):
         result.completed_at = now_stamp()
+        if self.blocks:
+            self.refresh_result_counts(result)
+        if self.cancelled and not result.scan_interrupted:
+            self.mark_interrupted(result, self.stop_reason or "manual cancellation")
         result.risk_score = min(100, max(0, result.risk_score))
         critical = any(i.severity == "Critical" for i in result.issues)
         high_count = sum(1 for i in result.issues if i.severity == "High")
-        if critical or result.risk_score >= 70:
+        if result.scan_interrupted and not critical and result.risk_score < 45:
+            result.status = "SCAN INTERRUPTED - PARTIAL RESULTS"
+        elif critical or result.risk_score >= 70:
             result.status = "Likely Fake or Failing"
         elif high_count >= 1 or result.risk_score >= 45:
             result.status = "Suspicious"
@@ -1146,6 +1323,8 @@ class StorageScanner:
             result.status = "Inconclusive"
         else:
             result.status = "No Major Issues Found"
+        if result.scan_interrupted and not result.status.startswith("SCAN INTERRUPTED"):
+            result.status = f"SCAN INTERRUPTED - PARTIAL RESULTS ({result.status})"
         result.conclusion = self.make_conclusion(result)
         try:
             self.generate_reports(result)
@@ -1165,7 +1344,8 @@ class StorageScanner:
             self.log(f"[Warning] Report generation failed: {exc}")
             self.logger.exception("Report generation failed")
         self.progress(100)
-        self.log(f"Scan completed. Final status: {result.status}")
+        self.emit_telemetry(result, result.status)
+        self.log(f"Scan finalized. Final status: {result.status}")
         return result
 
     def make_conclusion(self, result):
@@ -1177,6 +1357,8 @@ class StorageScanner:
             return "No decisive failure was found, but the warning level or scan coverage is not enough for a confident authenticity decision."
         if result.status == "Inconclusive":
             return "The scan did not gather enough write/read evidence to make a storage authenticity verdict."
+        if result.status.startswith("SCAN INTERRUPTED"):
+            return "The scan was interrupted before full completion. Current evidence was preserved and reports contain partial verified, corrupted, and failed ranges."
         return "No major issues were found in the tested range. This does not prove the entire device is genuine unless full capacity was validated."
 
     def write_session_block_csv(self, path):
@@ -1190,21 +1372,78 @@ class StorageScanner:
         reports_dir = ensure_reports_dir()
         clean_root = result.root.replace("\\", "_").replace("/", "_").replace(":", "")
         base = reports_dir / f"storage_report_{clean_root}_{file_stamp()}"
-        result.csv_report_path = str(base.with_suffix(".csv"))
-        self.write_session_block_csv(Path(result.csv_report_path))
+        enabled = set(self.settings.report_formats or REPORT_FORMATS)
+        if "CSV" in enabled:
+            result.csv_report_path = str(base.with_suffix(".csv"))
+        if "JSON" in enabled:
+            result.json_report_path = str(base.with_suffix(".json"))
+        if "Text" in enabled:
+            result.report_path = str(base.with_suffix(".txt"))
+        if "HTML" in enabled:
+            result.html_report_path = str(base.with_suffix(".html"))
         data = self.result_to_dict(result)
-        result.json_report_path = str(base.with_suffix(".json"))
-        Path(result.json_report_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
-        result.report_path = str(base.with_suffix(".txt"))
-        Path(result.report_path).write_text(self.text_report(result), encoding="utf-8")
-        result.html_report_path = str(base.with_suffix(".html"))
-        Path(result.html_report_path).write_text(self.html_report(result), encoding="utf-8")
+        if result.csv_report_path:
+            self.write_session_block_csv(Path(result.csv_report_path))
+        if result.json_report_path:
+            Path(result.json_report_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if result.report_path:
+            Path(result.report_path).write_text(self.text_report(result), encoding="utf-8")
+        if result.html_report_path:
+            Path(result.html_report_path).write_text(self.html_report(result), encoding="utf-8")
 
     def result_to_dict(self, result):
         data = asdict(result)
         data["issues"] = [asdict(i) if hasattr(i, "__dataclass_fields__") else i for i in result.issues]
         data["blocks"] = [asdict(b) for b in self.blocks]
+        data["corruption_ranges"] = self.block_ranges(lambda b: b.verification_result == "corrupt")
+        data["verified_ranges"] = self.block_ranges(lambda b: b.verification_result == "ok")
+        data["failed_ranges"] = self.block_ranges(lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed")
+        data["sha256_mismatch_evidence"] = [
+            {"block": b.index + 1, "offset": b.offset, "size": b.size, "details": b.error_details}
+            for b in self.blocks
+            if b.verification_result == "corrupt"
+        ]
         return data
+
+    def block_ranges(self, predicate):
+        selected = sorted([b for b in self.blocks if predicate(b)], key=lambda b: b.index)
+        ranges = []
+        if not selected:
+            return ranges
+        start = prev = selected[0]
+        for block in selected[1:]:
+            if block.index == prev.index + 1 and block.offset == prev.offset + prev.size:
+                prev = block
+                continue
+            ranges.append(self.range_dict(start, prev))
+            start = prev = block
+        ranges.append(self.range_dict(start, prev))
+        return ranges
+
+    def range_dict(self, start: BlockRecord, end: BlockRecord):
+        end_offset = end.offset + end.size
+        return {
+            "start_block": start.index + 1,
+            "end_block": end.index + 1,
+            "start_offset": start.offset,
+            "end_offset": end_offset,
+            "bytes": end_offset - start.offset,
+            "human_start_offset": human_bytes(start.offset),
+            "human_end_offset": human_bytes(end_offset),
+            "human_size": human_bytes(end_offset - start.offset),
+        }
+
+    def ranges_text(self, title, ranges):
+        lines = [title, "-" * 78]
+        if not ranges:
+            lines.append("None recorded.")
+            return lines
+        for item in ranges:
+            lines.append(
+                f"Blocks {item['start_block']}-{item['end_block']} | "
+                f"{item['human_start_offset']} to {item['human_end_offset']} | {item['human_size']}"
+            )
+        return lines
 
     def text_report(self, result: ScanResult) -> str:
         lines = [
@@ -1219,6 +1458,9 @@ class StorageScanner:
             "FINAL RESULT",
             "-" * 78,
             f"Status:     {result.status}",
+            f"Finalization Reason: {result.finalization_reason}",
+            f"Scan Interrupted: {'Yes' if result.scan_interrupted else 'No'}",
+            f"Interruption Reason: {result.interruption_reason or 'None'}",
             f"Risk Score: {result.risk_score}/100",
             f"Conclusion: {result.conclusion}",
             "",
@@ -1243,19 +1485,43 @@ class StorageScanner:
             "READ/WRITE VERIFICATION",
             "-" * 78,
             f"Blocks Written:       {result.blocks_tested}",
+            f"Processed Blocks:     {result.processed_blocks}",
             f"Verified Blocks:      {result.verified_blocks}",
             f"Failed Blocks:        {result.failed_blocks}",
+            f"Verified Bytes:       {human_bytes(result.verified_bytes)}",
+            f"Corrupted Bytes:      {human_bytes(result.corrupted_bytes)}",
+            f"Failed Bytes:         {human_bytes(result.failed_bytes)}",
+            f"Processed Bytes:      {human_bytes(result.processed_bytes)}",
+            f"Test Coverage:        {result.coverage_percent:.4f}% of reported capacity",
             f"Average Write Speed:  {result.write_mb_s:.2f} MB/s",
             f"Average Read Speed:   {result.read_mb_s:.2f} MB/s",
             f"Speed Variation:      {result.speed_variation_percent:.1f}%",
             f"Write Failures:       {result.write_failures}",
             f"Read Failures:        {result.read_failures}",
             f"Corrupted Blocks:     {result.corrupted_blocks}",
+            f"Corruption Percent:   {result.corruption_percent:.2f}% of processed bytes",
+            f"First Corruption Block: {result.first_corruption_block or 'None'}",
+            f"First Failure Timestamp: {result.first_failure_timestamp or 'None'}",
+            f"Last Successful Verified Block: {result.last_successful_block or 'None'}",
+            f"Consecutive Corruption Count: {result.consecutive_corruption_count}",
+            f"Max Consecutive Corruption Count: {result.max_consecutive_corruption_count}",
+            f"Corruption Start Offset: {human_bytes(result.corruption_start_offset) if result.first_corruption_block else 'None'}",
+            f"Estimated Authentic Usable Capacity: {human_bytes(result.estimated_valid_capacity_bytes)}",
             "",
             "SPEED DROPS",
             "-" * 78,
         ]
         lines += [json.dumps(d) for d in result.speed_drops] or ["None recorded."]
+        lines += [""] + self.ranges_text("VERIFIED RANGES", self.block_ranges(lambda b: b.verification_result == "ok"))
+        lines += [""] + self.ranges_text("FAILED / CORRUPTED RANGES", self.block_ranges(lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed"))
+        lines += [""] + self.ranges_text("CORRUPTION RANGES", self.block_ranges(lambda b: b.verification_result == "corrupt"))
+        mismatch_evidence = [b for b in self.blocks if b.verification_result == "corrupt"]
+        lines += ["", "SHA256 MISMATCH EVIDENCE", "-" * 78]
+        if mismatch_evidence:
+            for block in mismatch_evidence[:200]:
+                lines.append(f"Block {block.index + 1} offset {human_bytes(block.offset)}: {block.error_details}")
+        else:
+            lines.append("None recorded.")
         lines += ["", "FAKE-CAPACITY INDICATORS", "-" * 78]
         lines += result.fake_capacity_indicators or ["No strong fake-capacity indicators recorded."]
         lines += ["", "DEVICE / FILESYSTEM METADATA", "-" * 78, f"Drive Type: {result.drive_type}"]
@@ -1265,6 +1531,11 @@ class StorageScanner:
             lines.append(f"{k}: {v}")
         if result.metadata_warning:
             lines.append(f"Metadata Warning: {result.metadata_warning}")
+        lines += ["", "SMART SUMMARY", "-" * 78]
+        if result.smart_summary:
+            lines.append(json.dumps(result.smart_summary, indent=2))
+        else:
+            lines.append("Unavailable.")
         if result.smart_warning:
             lines.append(f"SMART Note: {result.smart_warning}")
         lines += ["", "FINDINGS", "-" * 78]
@@ -1285,6 +1556,9 @@ class StorageScanner:
         return "\n".join(lines)
 
     def html_report(self, result: ScanResult) -> str:
+        corruption_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result == "corrupt"), indent=2))
+        failed_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed"), indent=2))
+        verified_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result == "ok"), indent=2))
         rows = "".join(
             f"<tr><td>{b.index}</td><td>{human_bytes(b.offset)}</td><td>{human_bytes(b.size)}</td>"
             f"<td>{html.escape(b.write_status)}</td><td>{html.escape(b.verification_result)}</td>"
@@ -1304,10 +1578,20 @@ td,th{{border:1px solid #1B3355;padding:6px;text-align:left}} th{{background:#10
 </style></head><body>
 <h1>{APP_NAME} v{APP_VERSION}</h1>
 <div class="card"><h2>Final Result</h2><p class="status">{html.escape(result.status)}</p>
-<p class="risk">Risk score: {result.risk_score}/100</p><p>{html.escape(result.conclusion)}</p></div>
+<p class="risk">Risk score: {result.risk_score}/100</p><p>{html.escape(result.conclusion)}</p>
+<p>Finalization: {html.escape(result.finalization_reason)}<br>Interrupted: {'Yes' if result.scan_interrupted else 'No'}<br>Reason: {html.escape(result.interruption_reason or 'None')}</p></div>
 <div class="card"><h2>Timeline</h2><p>Started: {result.started_at}<br>Completed: {result.completed_at}<br>Session: {html.escape(result.session_id)}</p></div>
+<div class="card"><h2>Verification Statistics</h2>
+<p>Processed: {human_bytes(result.processed_bytes)} | Verified: {human_bytes(result.verified_bytes)} | Corrupted: {human_bytes(result.corrupted_bytes)} | Failed: {human_bytes(result.failed_bytes)}</p>
+<p>Coverage: {result.coverage_percent:.4f}% | Corruption: {result.corruption_percent:.2f}% | First corruption block: {result.first_corruption_block or 'None'} | Last successful block: {result.last_successful_block or 'None'}</p>
+<p>Estimated authentic usable capacity: {human_bytes(result.estimated_valid_capacity_bytes)} | First failure timestamp: {html.escape(result.first_failure_timestamp or 'None')}</p></div>
+<div class="card"><h2>Filesystem Metadata</h2><pre>{html.escape(json.dumps(result.volume_info, indent=2))}</pre></div>
 <div class="card"><h2>Drive Metadata</h2><pre>{html.escape(json.dumps(result.disk_metadata, indent=2))}</pre></div>
+<div class="card"><h2>SMART Summary</h2><pre>{html.escape(json.dumps(result.smart_summary or result.smart_warning or 'Unavailable', indent=2))}</pre></div>
 <div class="card"><h2>Findings</h2><ul>{issues or '<li>No major suspicious findings were detected.</li>'}</ul></div>
+<div class="card"><h2>Verified Ranges</h2><pre>{verified_ranges}</pre></div>
+<div class="card"><h2>Failed / Corrupted Ranges</h2><pre>{failed_ranges}</pre></div>
+<div class="card"><h2>Corruption Ranges</h2><pre>{corruption_ranges}</pre></div>
 <div class="card"><h2>Block Report Preview</h2><table><tr><th>#</th><th>Offset</th><th>Size</th><th>Write</th><th>Verify</th><th>Write MB/s</th><th>Read MB/s</th><th>Error</th></tr>{rows}</table></div>
 </body></html>"""
 
@@ -1619,7 +1903,13 @@ class CyberStorageVerifierApp(tk.Tk):
             ("ETA", "Unknown", CYBER_MUTED),
             ("Write Speed", "0 MB/s", CYBER_YELLOW),
             ("Read Speed", "0 MB/s", CYBER_BLUE),
+            ("Processed", "0 B", CYBER_CYAN),
+            ("Verified", "0 B", CYBER_GREEN),
+            ("Corrupted", "0 B", CYBER_RED),
             ("Corrupted Blocks", "0", CYBER_RED),
+            ("Failed Blocks", "0", CYBER_ORANGE),
+            ("Read Failures", "0", CYBER_ORANGE),
+            ("Current Block", "0 / 0", CYBER_CYAN),
             ("Risk Score", "0 / 100", CYBER_GREEN),
         ]
         for idx, (title, value, color) in enumerate(specs):
@@ -1731,6 +2021,16 @@ class CyberStorageVerifierApp(tk.Tk):
             r += 1
         self.progress_label = tk.Label(panel, text="0%", bg=CYBER_PANEL, fg=CYBER_CYAN, font=("Consolas", 11, "bold"))
         self.progress_label.grid(row=r, column=1, sticky="w", padx=18, pady=8)
+        r += 1
+        self.warning_banner_var = tk.StringVar(value="")
+        self.warning_banner = tk.Label(panel, textvariable=self.warning_banner_var, bg=CYBER_PANEL, fg=CYBER_RED, font=("Consolas", 11, "bold"), wraplength=900, justify="left")
+        self.warning_banner.grid(row=r, column=0, columnspan=2, sticky="ew", padx=18, pady=(4, 8))
+        r += 1
+        self.scan_viz = tk.Canvas(panel, height=96, bg="#07101D", highlightthickness=1, highlightbackground=CYBER_BORDER)
+        self.scan_viz.grid(row=r, column=0, columnspan=2, sticky="ew", padx=18, pady=8)
+        r += 1
+        self.processed_summary_var = tk.StringVar(value="Processed: 0 B | Verified: 0 B | Corrupted: 0 B")
+        tk.Label(panel, textvariable=self.processed_summary_var, bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Consolas", 11)).grid(row=r, column=0, columnspan=2, sticky="w", padx=18, pady=(4, 8))
         r += 1
         self.speed_trend_var = tk.StringVar(value="Speed trend: idle")
         tk.Label(panel, textvariable=self.speed_trend_var, bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Consolas", 11)).grid(row=r, column=0, columnspan=2, sticky="w", padx=18, pady=12)
@@ -2326,6 +2626,7 @@ li{{margin:7px 0}} code{{color:#39FF88}}
             ("Retry Delay Sec", "retry_delay_sec", tk.StringVar(value=str(self.settings.retry_delay_sec))),
             ("Delayed Verify Sec", "delayed_verify_seconds", tk.StringVar(value=str(self.settings.delayed_verify_seconds))),
             ("Random Recheck %", "random_recheck_percent", tk.StringVar(value=str(self.settings.random_recheck_percent))),
+            ("Severe Corruption Stop Blocks", "severe_corruption_blocks", tk.StringVar(value=str(self.settings.severe_corruption_blocks))),
         ]
         self.setting_vars = {}
         r = 1
@@ -2338,11 +2639,13 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         self.ps_var = tk.BooleanVar(value=self.settings.enable_powershell_metadata)
         self.exclude_c_var = tk.BooleanVar(value=self.settings.exclude_system_drive)
         self.warn_var = tk.BooleanVar(value=self.settings.show_advanced_warnings)
+        self.auto_stop_corruption_var = tk.BooleanVar(value=self.settings.auto_stop_severe_corruption)
         for text, var in (
             ("Enable SMART checks", self.smart_var),
             ("Enable PowerShell metadata checks", self.ps_var),
             ("Exclude system drive by default", self.exclude_c_var),
             ("Show advanced warnings", self.warn_var),
+            ("Auto-stop scan after severe continuous corruption", self.auto_stop_corruption_var),
         ):
             self.cyber_checkbutton(panel, text, var).grid(row=r, column=1, sticky="w", padx=18, pady=5)
             r += 1
@@ -2396,6 +2699,76 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         text.insert(tk.END, content)
         text.see(tk.END)
         text.configure(state="disabled")
+
+    def format_eta(self, seconds):
+        try:
+            seconds = max(0, int(seconds))
+        except Exception:
+            return "Unknown"
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def update_scan_visualization(self, metrics):
+        if not hasattr(self, "scan_viz"):
+            return
+        canvas = self.scan_viz
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width() or 900)
+        height = max(1, canvas.winfo_height() or 96)
+        pad = 14
+        bar_x = pad
+        bar_y = 24
+        bar_w = max(1, width - pad * 2)
+        bar_h = 22
+        test_size = max(1, int(metrics.get("test_size_bytes") or 1))
+        processed = min(test_size, int(metrics.get("processed_bytes") or 0))
+        verified = min(test_size, int(metrics.get("verified_bytes") or 0))
+        corrupted = min(test_size, int(metrics.get("corrupted_bytes") or 0))
+        failed = min(test_size, int(metrics.get("failed_bytes") or 0))
+
+        canvas.create_rectangle(bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, outline=CYBER_BORDER, fill="#0B1220")
+        verified_w = bar_w * verified / test_size
+        corrupt_w = bar_w * corrupted / test_size
+        failed_w = bar_w * failed / test_size
+        processed_w = bar_w * processed / test_size
+        canvas.create_rectangle(bar_x, bar_y, bar_x + processed_w, bar_y + bar_h, outline="", fill="#12304A")
+        canvas.create_rectangle(bar_x, bar_y, bar_x + verified_w, bar_y + bar_h, outline="", fill=CYBER_GREEN)
+        canvas.create_rectangle(bar_x + verified_w, bar_y, bar_x + verified_w + corrupt_w, bar_y + bar_h, outline="", fill=CYBER_RED)
+        canvas.create_rectangle(bar_x + verified_w + corrupt_w, bar_y, bar_x + verified_w + corrupt_w + failed_w, bar_y + bar_h, outline="", fill=CYBER_ORANGE)
+        current_offset = int(metrics.get("current_offset") or 0)
+        current_x = bar_x + min(bar_w, bar_w * current_offset / test_size)
+        canvas.create_line(current_x, bar_y - 8, current_x, bar_y + bar_h + 8, fill=CYBER_CYAN, width=2)
+        canvas.create_text(bar_x, 10, anchor="w", fill=CYBER_MUTED, font=("Consolas", 9), text="processed / verified / corrupted")
+        canvas.create_text(bar_x, height - 24, anchor="w", fill=CYBER_GREEN, font=("Consolas", 9), text=f"Verified {human_bytes(verified)}")
+        canvas.create_text(bar_x + bar_w * 0.38, height - 24, anchor="w", fill=CYBER_RED, font=("Consolas", 9), text=f"Corrupted {human_bytes(corrupted)}")
+        canvas.create_text(bar_x + bar_w * 0.70, height - 24, anchor="w", fill=CYBER_CYAN, font=("Consolas", 9), text=f"Processed {human_bytes(processed)}")
+
+    def update_live_findings_from_metrics(self, metrics):
+        if not metrics.get("first_corruption_block") and not metrics.get("failed_blocks"):
+            return
+        lines = [
+            "LIVE CORRUPTION TRACKING",
+            "",
+            f"Current phase: {metrics.get('phase', 'Unknown')}",
+            f"Current block: {metrics.get('block', 0)} / {metrics.get('total_blocks', 0)}",
+            f"Corrupted blocks: {metrics.get('corrupted_blocks', 0)}",
+            f"Failed blocks: {metrics.get('failed_blocks', 0)}",
+            f"Read failures: {metrics.get('read_failures', 0)}",
+            f"Corruption percentage: {metrics.get('corruption_percent', 0):.2f}% of processed bytes",
+            f"First corruption block: {metrics.get('first_corruption_block') or 'None'}",
+            f"Consecutive corruption count: {metrics.get('consecutive_corruption_count', 0)}",
+            f"Estimated valid capacity before corruption: {human_bytes(metrics.get('estimated_valid_capacity_bytes', 0))}",
+            "",
+            f"Processed: {human_bytes(metrics.get('processed_bytes', 0))}",
+            f"Verified: {human_bytes(metrics.get('verified_bytes', 0))}",
+            f"Corrupted: {human_bytes(metrics.get('corrupted_bytes', 0))}",
+        ]
+        self.set_text(self.findings_text, "\n".join(lines))
 
     def log_callback(self, message):
         logging.info(message)
@@ -2510,7 +2883,26 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         for var in self.progress_vars.values():
             var.set(0)
         self.progress_label.config(text="0%")
-        for name, value in (("Current Phase", "Starting"), ("ETA", "Calculating"), ("Write Speed", "0 MB/s"), ("Read Speed", "0 MB/s"), ("Corrupted Blocks", "0"), ("Risk Score", "0 / 100")):
+        if hasattr(self, "warning_banner_var"):
+            self.warning_banner_var.set("")
+        if hasattr(self, "processed_summary_var"):
+            self.processed_summary_var.set("Processed: 0 B | Verified: 0 B | Corrupted: 0 B")
+        if hasattr(self, "scan_viz"):
+            self.scan_viz.delete("all")
+        for name, value in (
+            ("Current Phase", "Starting"),
+            ("ETA", "Calculating"),
+            ("Write Speed", "0 MB/s"),
+            ("Read Speed", "0 MB/s"),
+            ("Processed", "0 B"),
+            ("Verified", "0 B"),
+            ("Corrupted", "0 B"),
+            ("Corrupted Blocks", "0"),
+            ("Failed Blocks", "0"),
+            ("Read Failures", "0"),
+            ("Current Block", "0 / 0"),
+            ("Risk Score", "0 / 100"),
+        ):
             self.cards[name].value_label.config(text=value)
 
     def resume_previous_scan(self):
@@ -2594,17 +2986,24 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         self.cards["Selected Drive"].value_label.config(text=res.root)
         self.cards["Reported Capacity"].value_label.config(text=human_bytes(res.capacity_reported_bytes))
         self.cards["Free Space"].value_label.config(text=human_bytes(res.free_bytes))
-        coverage = (res.test_size_bytes / max(1, res.capacity_reported_bytes)) * 100 if res.capacity_reported_bytes else 0
+        coverage = res.coverage_percent or ((res.processed_bytes / max(1, res.capacity_reported_bytes)) * 100 if res.capacity_reported_bytes else 0)
         self.cards["Test Coverage"].value_label.config(text=f"{coverage:.2f}%")
         self.cards["Current Phase"].value_label.config(text=res.status)
         self.cards["Write Speed"].value_label.config(text=f"{res.write_mb_s:.2f} MB/s")
         self.cards["Read Speed"].value_label.config(text=f"{res.read_mb_s:.2f} MB/s")
+        self.cards["Processed"].value_label.config(text=human_bytes(res.processed_bytes))
+        self.cards["Verified"].value_label.config(text=human_bytes(res.verified_bytes))
+        self.cards["Corrupted"].value_label.config(text=human_bytes(res.corrupted_bytes))
         self.cards["Corrupted Blocks"].value_label.config(text=str(res.corrupted_blocks))
+        self.cards["Failed Blocks"].value_label.config(text=str(res.failed_blocks))
+        self.cards["Read Failures"].value_label.config(text=str(res.read_failures))
+        self.cards["Current Block"].value_label.config(text=f"{res.current_block_index} / {res.total_blocks}")
         self.cards["Risk Score"].value_label.config(text=f"{res.risk_score} / 100")
         risk_color = CYBER_RED if res.risk_score >= 70 else CYBER_ORANGE if res.risk_score >= 30 else CYBER_GREEN
         self.cards["Risk Score"].value_label.config(fg=risk_color)
         self.update_device_text(res)
         self.update_findings_text(res)
+        self.update_scan_visualization(asdict(res))
         self.refresh_history()
         self.refresh_sessions()
 
@@ -2643,7 +3042,10 @@ li{{margin:7px 0}} code{{color:#39FF88}}
                 msg = self.log_queue.get_nowait()
                 if msg == "SCAN_COMPLETE":
                     self.update_results_cards()
-                    self.header_status.config(text="COMPLETED", fg=CYBER_GREEN)
+                    if self.last_result and self.last_result.scan_interrupted:
+                        self.header_status.config(text="PARTIAL REPORT READY", fg=CYBER_ORANGE)
+                    else:
+                        self.header_status.config(text="COMPLETED", fg=CYBER_GREEN)
                 else:
                     self.append_text(self.log_text, str(msg) + "\n")
         except queue.Empty:
@@ -2673,6 +3075,47 @@ li{{margin:7px 0}} code{{color:#39FF88}}
                     speed = metrics["read_speed"]
                     self.cards["Read Speed"].value_label.config(text=f"{speed:.2f} MB/s")
                     self.speed_trend_var.set(f"Speed trend: read {speed:.2f} MB/s at block {metrics.get('block', '-')}")
+                if "eta_seconds" in metrics:
+                    self.cards["ETA"].value_label.config(text=self.format_eta(metrics.get("eta_seconds")))
+                if "verified_bytes" in metrics:
+                    self.cards["Verified"].value_label.config(text=human_bytes(metrics.get("verified_bytes", 0)))
+                if "corrupted_bytes" in metrics:
+                    self.cards["Corrupted"].value_label.config(text=human_bytes(metrics.get("corrupted_bytes", 0)))
+                if "processed_bytes" in metrics:
+                    self.cards["Processed"].value_label.config(text=human_bytes(metrics.get("processed_bytes", 0)))
+                if "corrupted_blocks" in metrics:
+                    self.cards["Corrupted Blocks"].value_label.config(text=str(metrics.get("corrupted_blocks", 0)))
+                if "failed_blocks" in metrics:
+                    self.cards["Failed Blocks"].value_label.config(text=str(metrics.get("failed_blocks", 0)))
+                if "read_failures" in metrics:
+                    self.cards["Read Failures"].value_label.config(text=str(metrics.get("read_failures", 0)))
+                if "risk_score" in metrics:
+                    risk = int(metrics.get("risk_score", 0))
+                    self.cards["Risk Score"].value_label.config(text=f"{risk} / 100")
+                    self.cards["Risk Score"].value_label.config(fg=CYBER_RED if risk >= 70 else CYBER_ORANGE if risk >= 30 else CYBER_GREEN)
+                if "coverage_percent" in metrics:
+                    self.cards["Test Coverage"].value_label.config(text=f"{metrics.get('coverage_percent', 0):.2f}%")
+                if "block" in metrics:
+                    self.cards["Current Block"].value_label.config(text=f"{metrics.get('block', 0)} / {metrics.get('total_blocks', 0)}")
+                    self.progress_vars["block"].set((float(metrics.get("block", 0)) / max(1, float(metrics.get("total_blocks", 1)))) * 100)
+                if "processed_bytes" in metrics:
+                    processed = metrics.get("processed_bytes", 0)
+                    test_size = max(1, metrics.get("test_size_bytes", 1))
+                    self.progress_vars["read"].set((processed / test_size) * 100)
+                    self.processed_summary_var.set(
+                        f"Processed: {human_bytes(processed)} | "
+                        f"Verified: {human_bytes(metrics.get('verified_bytes', 0))} | "
+                        f"Corrupted: {human_bytes(metrics.get('corrupted_bytes', 0))}"
+                    )
+                    self.update_scan_visualization(metrics)
+                if metrics.get("first_corruption_block"):
+                    valid = human_bytes(metrics.get("estimated_valid_capacity_bytes", 0))
+                    self.warning_banner_var.set(
+                        f"WARNING: corruption began at block {metrics.get('first_corruption_block')} "
+                        f"({metrics.get('corruption_percent', 0):.2f}% of processed bytes). "
+                        f"Estimated authentic usable capacity before corruption: {valid}."
+                    )
+                self.update_live_findings_from_metrics(metrics)
         except queue.Empty:
             pass
         self.after(100, self.process_queues)
@@ -2682,10 +3125,12 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         self.settings.retry_delay_sec = max(0.0, safe_float(self.setting_vars.get("retry_delay_sec", tk.StringVar(value="0.4")).get(), 0.4))
         self.settings.delayed_verify_seconds = max(0, safe_int(self.setting_vars.get("delayed_verify_seconds", tk.StringVar(value="0")).get(), 0))
         self.settings.random_recheck_percent = max(0, min(100, safe_int(self.setting_vars.get("random_recheck_percent", tk.StringVar(value="8")).get(), 8)))
+        self.settings.severe_corruption_blocks = max(1, safe_int(self.setting_vars.get("severe_corruption_blocks", tk.StringVar(value="100")).get(), 100))
         self.settings.enable_smart_checks = self.smart_var.get()
         self.settings.enable_powershell_metadata = self.ps_var.get()
         self.settings.exclude_system_drive = self.exclude_c_var.get()
         self.settings.show_advanced_warnings = self.warn_var.get()
+        self.settings.auto_stop_severe_corruption = self.auto_stop_corruption_var.get()
 
     def discover_sessions(self):
         sessions = []
