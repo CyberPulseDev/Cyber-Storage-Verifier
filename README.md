@@ -143,15 +143,6 @@ The latest update significantly improves forensic telemetry synchronization, cor
 - Better interrupted-session recovery
 - Improved corruption persistence tracking
 
-## Requirements
-
-- Windows 11 recommended
-- Python 3.9 or later
-- Tkinter, included with most Python Windows installers
-- Optional: [smartmontools](https://www.smartmontools.org/) for deeper SMART health checks
-
-No external Python packages are required.
-
 # Requirements
 
 - Windows 11 recommended
