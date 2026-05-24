@@ -1,3 +1,25 @@
-# No external Python packages required.
-# Tkinter is included with most Python Windows installers.
-# Optional: install smartmontools separately for SMART checks.
+# Cyber Storage Verifier v2.0
+# Core application uses only Python standard libraries + Tkinter.
+# Windows 11 / Python 3.9+ recommended.
+
+# =========================
+# OPTIONAL PDF EXPORT
+# =========================
+
+# Preferred PDF engine
+weasyprint>=62.0
+
+# Alternative PDF engine (optional fallback)
+pdfkit>=1.0.0
+
+# =========================
+# OPTIONAL SYSTEM TOOLS
+# =========================
+
+# Install smartmontools separately for SMART checks:
+# https://www.smartmontools.org/
+
+# If using pdfkit, install wkhtmltopdf separately:
+# https://wkhtmltopdf.org/downloads.html
+
+# Tkinter is included with most Windows Python installers.
