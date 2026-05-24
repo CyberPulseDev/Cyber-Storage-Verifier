@@ -1,8 +1,10 @@
 # Cyber Storage Verifier
 
-**Cyber Storage Verifier** is a Windows-focused Python desktop application that checks HDDs, SSDs, USB flash drives, SD cards, and other external storage devices for counterfeit capacity indicators, unstable read/write behavior, metadata anomalies, and basic health indicators.
+**Cyber Storage Verifier** is an advanced Windows-focused forensic storage validation and integrity analysis application designed to detect counterfeit USB drives, fake-capacity storage devices, unstable NAND behavior, corruption anomalies, metadata inconsistencies, and suspicious storage behavior.
 
-The tool performs verification using normal temporary files inside the selected target folder. It does **not** write directly to raw disks.
+The application supports HDDs, SSDs, USB flash drives, SD cards, external drives, and removable storage devices through resumable block-level write/read verification using temporary test files created safely inside the selected target directory.
+
+The tool never writes directly to raw disks or partitions.
 
 ## Features
 
@@ -23,6 +25,13 @@ The tool performs verification using normal temporary files inside the selected 
 - Text, JSON, CSV, and HTML report generation
 - Scan history and session checkpoints
 - Cyber-style Tkinter GUI
+- Advanced cyber-forensic HTML dashboard reports
+- Professional PDF forensic report export
+- Storage authenticity visualization map
+- SHA-256 mismatch forensic evidence tables
+- Risk indicator and corruption analytics panels
+- Visual corruption telemetry dashboard
+- Interactive forensic-style reporting interface
 
 ## Screenshots
 
@@ -35,77 +44,103 @@ The tool performs verification using normal temporary files inside the selected 
 <img width="1353" height="852" alt="Screenshot 2026-05-23 205433" src="https://github.com/user-attachments/assets/7918071d-6cdc-420a-9c5f-c1c0a0469a01" />
 <img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
 <img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
+#New UI Update
+<img width="1918" height="986" alt="image" src="https://github.com/user-attachments/assets/dcabb658-0741-432b-9db1-bda6281568bb" />
 
-## Latest Improvements 24/05/2026
 
-The latest update significantly improves scan telemetry synchronization, corruption tracking, resumable recovery, and partial report generation while preserving the existing integrity validation engine and scan architecture.
+# Latest Improvements — 24/05/2026
 
-### Added & Improved
+The latest update significantly improves forensic telemetry synchronization, corruption analytics, resumable recovery, evidence preservation, report rendering, and PDF export support while preserving the original integrity validation engine and scan architecture.
 
-- Live recalculation of:
+## Added Advanced Forensic Reporting System
+
+- Fully redesigned cyber-forensic HTML dashboard reports
+- Professional evidence presentation layout
+- Storage authenticity visualization maps
+- Verified/corrupted/failed range visualization
+- SHA-256 mismatch evidence tables
+- Corruption timeline analytics
+- Risk indicator widgets
+- Final warning evidence panels
+- Visual corruption telemetry dashboards
+- Added PDF forensic report exporting
+- Improved non-technical readability
+- Improved evidence presentation for dispute/report submissions
+
+## Added & Improved
+
+### Live Telemetry Improvements
+
+- Real-time recalculation of:
   - Processed blocks
   - Verified blocks
   - Corrupted blocks
   - Failed blocks
   - Read failures
-  - Risk score
   - Coverage percentage
   - Current scan phase
   - Current block tracking
+  - Estimated authentic capacity
 
-- Fixed verification progress behavior
-  - Processed progress now advances even during corruption
-  - Verified capacity only counts successful SHA-256 validated blocks
-  - Separate tracking for:
-    - Verified data
-    - Corrupted data
-    - Failed data
-    - Processed data
+### Verification Improvements
 
-- Added partial scan finalization
-  - Reports now generate even if scans are manually stopped
-  - Supports:
-    - Stop Scan
-    - Cancel
-    - Emergency Stop
-    - Severe corruption auto-stop
-  - Reports are marked:
-    - `SCAN INTERRUPTED - PARTIAL RESULTS`
+- Processed progress now advances even during corruption
+- Verified capacity counts only SHA-256 validated blocks
+- Separate tracking for:
+  - Verified data
+  - Corrupted data
+  - Failed data
+  - Processed data
 
-- Added advanced corruption intelligence
-  - First corruption block detection
-  - Corruption percentage analysis
-  - Consecutive corruption tracking
-  - Corruption start offset detection
-  - Estimated authentic usable capacity
-  - SHA-256 mismatch evidence
-  - Verified/corrupted/failed range mapping
+### Partial Scan Finalization
 
-- Enhanced reporting engine
-  - TXT / JSON / CSV / HTML improvements
-  - Partial-session evidence preservation
-  - Corruption timelines
-  - SMART summaries
-  - Device metadata
-  - Interruption reasons
-  - Verified and failed range reporting
+- Reports now generate even if scans are interrupted through:
+  - Stop Scan
+  - Cancel
+  - Emergency Stop
+  - Severe corruption auto-stop
 
-- Added optional severe corruption auto-stop
-  - Automatically finalizes scans after configurable consecutive corruption thresholds
-  - Disabled by default
-  - Configurable from Settings
+- Interrupted reports are clearly marked:
+  - `SCAN INTERRUPTED - PARTIAL RESULTS`
 
-- Improved Active Scan UI
-  - Warning banners
-  - Live corruption visualization
-  - Processed vs verified telemetry
-  - Stabilized ETA calculations
-  - Live findings updates
+### Advanced Corruption Intelligence
 
-- Improved resumable scan reliability
-  - Enhanced checkpoint synchronization
-  - Improved finalize() and finish_session() handling
-  - Better interrupted-session recovery
+- First corruption block detection
+- Corruption percentage analytics
+- Consecutive corruption tracking
+- Corruption start offset detection
+- Estimated authentic usable capacity
+- SHA-256 mismatch evidence generation
+- Verified/corrupted/failed range mapping
+- Fake-capacity boundary detection
+
+### Reporting Engine Enhancements
+
+- TXT / JSON / CSV / HTML / PDF support
+- Corruption timeline visualization
+- SMART summaries
+- Device metadata
+- Interruption reasons
+- Verified and failed range reporting
+- Storage authenticity visualization
+- Risk indicator dashboards
+
+### UI Improvements
+
+- Advanced forensic dashboard design
+- Improved telemetry widgets
+- Warning banners
+- Corruption visualization
+- Stabilized ETA calculations
+- Live findings updates
+- Improved forensic evidence readability
+
+### Resume Engine Improvements
+
+- Enhanced checkpoint synchronization
+- Improved finalize() handling
+- Better interrupted-session recovery
+- Improved corruption persistence tracking
 
 ## Requirements
 
@@ -116,33 +151,68 @@ The latest update significantly improves scan telemetry synchronization, corrupt
 
 No external Python packages are required.
 
-## Installation
+# Requirements
 
-Clone the repository:
+- Windows 11 recommended
+- Python 3.9 or later
+- Tkinter (included with most Windows Python installers)
+
+## Optional Python Dependencies
+
+- For advanced PDF export support:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/cyber-storage-verifier.git
-cd cyber-storage-verifier
+pip install weasyprint
 ```
 
-Create a virtual environment, optional but recommended:
+- OR
+
+```bash
+pip install pdfkit
+```
+
+- If using `pdfkit`, also install:
+  - wkhtmltopdf
+  - https://wkhtmltopdf.org/downloads.html
+
+## Optional SMART Health Checks
+
+- Install smartmontools for deeper SMART analysis:
+  - https://www.smartmontools.org/
+
+- The application still works without smartmontools installed.
+
+---
+
+# Installation
+
+- Clone the repository:
+
+```bash
+git clone https://github.com/CyberPulseDev/Cyber-Storage-Verifier.git
+cd Cyber-Storage-Verifier
+```
+
+- Create a virtual environment (optional but recommended):
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-Install requirements:
+- Install requirements:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run the application:
+- Run the application:
 
 ```bash
 python cyber_storage_verifier.py
 ```
+
+---
 
 ## How to Use
 
