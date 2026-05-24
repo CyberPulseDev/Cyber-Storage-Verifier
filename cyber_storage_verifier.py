@@ -75,7 +75,7 @@ INPUT_BORDER = "#2C5E8F"
 INPUT_BORDER_FOCUS = "#00E5FF"
 
 BOUNDARY_PRESETS = [8, 16, 32, 64, 128, 256]
-REPORT_FORMATS = ("Text", "JSON", "CSV", "HTML")
+REPORT_FORMATS = ("Text", "JSON", "CSV", "HTML", "PDF")
 SCAN_MODES = (
     "Quick Scan",
     "Balanced Scan",
@@ -437,6 +437,7 @@ class ScanResult:
     json_report_path: str = ""
     csv_report_path: str = ""
     html_report_path: str = ""
+    pdf_report_path: str = ""
     session_id: str = ""
     session_dir: str = ""
     scan_mode: str = "Balanced Scan"
@@ -451,7 +452,7 @@ class ScannerSettings:
     flush_policy: str = "Balanced"
     retry_count: int = 2
     retry_delay_sec: float = 0.4
-    report_formats: list = field(default_factory=lambda: ["Text", "JSON", "CSV", "HTML"])
+    report_formats: list = field(default_factory=lambda: ["Text", "JSON", "CSV", "HTML", "PDF"])
     auto_cleanup_old_sessions: bool = False
     theme: str = "Cyber"
     show_advanced_warnings: bool = True
@@ -1294,6 +1295,7 @@ class StorageScanner:
         self.session["json_report_path"] = result.json_report_path
         self.session["csv_report_path"] = result.csv_report_path
         self.session["html_report_path"] = result.html_report_path
+        self.session["pdf_report_path"] = result.pdf_report_path
         try:
             self.save_checkpoint()
             self.write_session_block_csv(Path(self.session["session_dir"]) / BLOCK_REPORT_NAME)
@@ -1337,6 +1339,8 @@ class StorageScanner:
                     "scan_mode": result.scan_mode,
                     "test_size": human_bytes(result.test_size_bytes),
                     "report_path": result.report_path,
+                    "html_report_path": result.html_report_path,
+                    "pdf_report_path": result.pdf_report_path,
                     "session_dir": result.session_dir,
                 }
             )
@@ -1381,15 +1385,19 @@ class StorageScanner:
             result.report_path = str(base.with_suffix(".txt"))
         if "HTML" in enabled:
             result.html_report_path = str(base.with_suffix(".html"))
-        data = self.result_to_dict(result)
+        if "PDF" in enabled:
+            result.pdf_report_path = str(base.with_suffix(".pdf"))
         if result.csv_report_path:
             self.write_session_block_csv(Path(result.csv_report_path))
-        if result.json_report_path:
-            Path(result.json_report_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
         if result.report_path:
             Path(result.report_path).write_text(self.text_report(result), encoding="utf-8")
         if result.html_report_path:
             Path(result.html_report_path).write_text(self.html_report(result), encoding="utf-8")
+        if result.pdf_report_path:
+            self.write_pdf_report(result)
+        data = self.result_to_dict(result)
+        if result.json_report_path:
+            Path(result.json_report_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def result_to_dict(self, result):
         data = asdict(result)
@@ -1404,6 +1412,26 @@ class StorageScanner:
             if b.verification_result == "corrupt"
         ]
         return data
+
+    def write_pdf_report(self, result: ScanResult):
+        if not result.pdf_report_path:
+            return False
+        html_content = self.html_report(result, for_pdf=True)
+        try:
+            from weasyprint import HTML
+            HTML(string=html_content, base_url=str(ensure_reports_dir())).write_pdf(result.pdf_report_path)
+            return True
+        except Exception as exc:
+            self.log(f"[Info] WeasyPrint PDF export unavailable: {exc}")
+        try:
+            import pdfkit
+            pdfkit.from_string(html_content, result.pdf_report_path)
+            return True
+        except Exception as exc:
+            self.log(f"[Info] pdfkit/wkhtmltopdf PDF export unavailable: {exc}")
+        result.pdf_report_path = ""
+        self.log("[Info] PDF report was not generated. Install WeasyPrint or pdfkit with wkhtmltopdf to enable PDF export.")
+        return False
 
     def block_ranges(self, predicate):
         selected = sorted([b for b in self.blocks if predicate(b)], key=lambda b: b.index)
@@ -1555,45 +1583,187 @@ class StorageScanner:
         ]
         return "\n".join(lines)
 
-    def html_report(self, result: ScanResult) -> str:
-        corruption_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result == "corrupt"), indent=2))
-        failed_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed"), indent=2))
-        verified_ranges = html.escape(json.dumps(self.block_ranges(lambda b: b.verification_result == "ok"), indent=2))
-        rows = "".join(
-            f"<tr><td>{b.index}</td><td>{human_bytes(b.offset)}</td><td>{human_bytes(b.size)}</td>"
-            f"<td>{html.escape(b.write_status)}</td><td>{html.escape(b.verification_result)}</td>"
-            f"<td>{b.write_speed_mb_s:.2f}</td><td>{b.read_speed_mb_s:.2f}</td>"
-            f"<td>{html.escape(b.error_details)}</td></tr>"
-            for b in self.blocks[:500]
+    def report_log_preview(self, max_lines=60):
+        log_path = ensure_reports_dir() / LOG_FILE_NAME
+        try:
+            if log_path.exists():
+                return "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+        except Exception:
+            pass
+        return "N/A"
+
+    def html_table_rows_for_ranges(self, ranges):
+        if not ranges:
+            return "<tr><td colspan=\"5\">N/A</td></tr>"
+        return "".join(
+            "<tr>"
+            f"<td>{item['start_block']}</td>"
+            f"<td>{item['end_block']}</td>"
+            f"<td>{html.escape(item['human_start_offset'])}</td>"
+            f"<td>{html.escape(item['human_end_offset'])}</td>"
+            f"<td>{html.escape(item['human_size'])}</td>"
+            "</tr>"
+            for item in ranges
         )
-        issues = "".join(f"<li><b>{html.escape(i.severity)} - {html.escape(i.title)}</b>: {html.escape(i.detail)}</li>" for i in result.issues)
+
+    def html_report(self, result: ScanResult, for_pdf=False) -> str:
+        verified_ranges_raw = self.block_ranges(lambda b: b.verification_result == "ok")
+        failed_ranges_raw = self.block_ranges(lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed")
+        corruption_ranges_raw = self.block_ranges(lambda b: b.verification_result == "corrupt")
+        cap = max(1, result.capacity_reported_bytes or result.test_size_bytes or result.processed_bytes or 1)
+        verified_pct = max(0.6 if result.verified_bytes else 0, min(100, result.verified_bytes / cap * 100))
+        failed_bytes = max(result.failed_bytes, result.corrupted_bytes)
+        failed_pct = max(0.6 if failed_bytes else 0, min(100, failed_bytes / cap * 100))
+        untested_pct = max(0, 100 - verified_pct - failed_pct)
+        risk_class = "danger" if result.risk_score >= 70 or result.corrupted_blocks else "warn" if result.risk_score >= 30 else "good"
+        status_text = html.escape(result.status or "N/A")
+        warning_text = "DO NOT TRUST THIS DEVICE WITH IMPORTANT DATA" if result.risk_score >= 70 or result.corrupted_blocks or result.failed_blocks else "Review coverage before trusting this device"
+        issues = "".join(
+            f"<li><b>{html.escape(i.severity)} - {html.escape(i.title)}</b><span>{html.escape(i.detail)}</span></li>"
+            for i in result.issues
+        ) or "<li><b>No major findings</b><span>No suspicious findings were recorded in the tested range.</span></li>"
+        indicators = result.fake_capacity_indicators or []
+        risk_indicators = "".join(f"<li>{html.escape(str(item))}</li>" for item in indicators) or "<li>N/A</li>"
+        speed_drops = "".join(f"<li>{html.escape(json.dumps(d))}</li>" for d in result.speed_drops) or "<li>None recorded.</li>"
+        mismatch_blocks = [b for b in self.blocks if b.verification_result == "corrupt"]
+        mismatch_rows = "".join(
+            "<tr>"
+            f"<td>{b.index + 1}</td>"
+            f"<td>{html.escape(human_bytes(b.offset))}</td>"
+            f"<td>{html.escape(b.expected_sha256 or 'N/A')}</td>"
+            f"<td>{html.escape((b.error_details or 'N/A')[-96:])}</td>"
+            f"<td class=\"bad\">MISMATCH</td>"
+            "</tr>"
+            for b in mismatch_blocks[:120]
+        ) or "<tr><td colspan=\"5\">N/A</td></tr>"
+        block_rows = "".join(
+            "<tr>"
+            f"<td>{b.index + 1}</td>"
+            f"<td>{html.escape(human_bytes(b.offset))}</td>"
+            f"<td>{html.escape(human_bytes(b.size))}</td>"
+            f"<td>{html.escape(b.write_status)}</td>"
+            f"<td>{html.escape(b.verification_result)}</td>"
+            f"<td>{b.write_speed_mb_s:.2f}</td>"
+            f"<td>{b.read_speed_mb_s:.2f}</td>"
+            f"<td>{html.escape(b.error_details or '')}</td>"
+            "</tr>"
+            for b in self.blocks[:500]
+        ) or "<tr><td colspan=\"8\">N/A</td></tr>"
+        log_preview = html.escape(self.report_log_preview())
+        forensic_summary = (
+            f"Corruption begins at {human_bytes(result.corruption_start_offset)}. "
+            f"Estimated authentic usable capacity is {human_bytes(result.estimated_valid_capacity_bytes)}. "
+            f"{result.corruption_percent:.2f}% of processed bytes are corrupted."
+            if result.first_corruption_block
+            else "No corruption boundary was recorded in the tested range."
+        )
+        pdf_css = "@page { size: A3 landscape; margin: 10mm; }" if for_pdf else ""
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{APP_NAME} Report</title>
 <style>
-body{{font-family:Segoe UI,Arial,sans-serif;background:#070B14;color:#D7F7FF;margin:24px}}
-.card{{background:#0B1220;border:1px solid #1B3355;padding:16px;margin:12px 0}}
-h1,h2{{color:#00E5FF}} table{{width:100%;border-collapse:collapse;font-size:12px}}
-td,th{{border:1px solid #1B3355;padding:6px;text-align:left}} th{{background:#101A2C}}
-.status{{color:#39FF88;font-weight:700}} .risk{{color:#FFD166;font-weight:700}}
-</style></head><body>
-<h1>{APP_NAME} v{APP_VERSION}</h1>
-<div class="card"><h2>Final Result</h2><p class="status">{html.escape(result.status)}</p>
-<p class="risk">Risk score: {result.risk_score}/100</p><p>{html.escape(result.conclusion)}</p>
-<p>Finalization: {html.escape(result.finalization_reason)}<br>Interrupted: {'Yes' if result.scan_interrupted else 'No'}<br>Reason: {html.escape(result.interruption_reason or 'None')}</p></div>
-<div class="card"><h2>Timeline</h2><p>Started: {result.started_at}<br>Completed: {result.completed_at}<br>Session: {html.escape(result.session_id)}</p></div>
-<div class="card"><h2>Verification Statistics</h2>
-<p>Processed: {human_bytes(result.processed_bytes)} | Verified: {human_bytes(result.verified_bytes)} | Corrupted: {human_bytes(result.corrupted_bytes)} | Failed: {human_bytes(result.failed_bytes)}</p>
-<p>Coverage: {result.coverage_percent:.4f}% | Corruption: {result.corruption_percent:.2f}% | First corruption block: {result.first_corruption_block or 'None'} | Last successful block: {result.last_successful_block or 'None'}</p>
-<p>Estimated authentic usable capacity: {human_bytes(result.estimated_valid_capacity_bytes)} | First failure timestamp: {html.escape(result.first_failure_timestamp or 'None')}</p></div>
-<div class="card"><h2>Filesystem Metadata</h2><pre>{html.escape(json.dumps(result.volume_info, indent=2))}</pre></div>
-<div class="card"><h2>Drive Metadata</h2><pre>{html.escape(json.dumps(result.disk_metadata, indent=2))}</pre></div>
-<div class="card"><h2>SMART Summary</h2><pre>{html.escape(json.dumps(result.smart_summary or result.smart_warning or 'Unavailable', indent=2))}</pre></div>
-<div class="card"><h2>Findings</h2><ul>{issues or '<li>No major suspicious findings were detected.</li>'}</ul></div>
-<div class="card"><h2>Verified Ranges</h2><pre>{verified_ranges}</pre></div>
-<div class="card"><h2>Failed / Corrupted Ranges</h2><pre>{failed_ranges}</pre></div>
-<div class="card"><h2>Corruption Ranges</h2><pre>{corruption_ranges}</pre></div>
-<div class="card"><h2>Block Report Preview</h2><table><tr><th>#</th><th>Offset</th><th>Size</th><th>Write</th><th>Verify</th><th>Write MB/s</th><th>Read MB/s</th><th>Error</th></tr>{rows}</table></div>
-</body></html>"""
+{pdf_css}
+:root {{
+  --bg:#050912; --panel:#07111f; --panel2:#0a1728; --line:#163657; --cyan:#00e5ff;
+  --green:#39ff88; --red:#ff244f; --orange:#ff9f1c; --yellow:#ffd166; --text:#d7f7ff; --muted:#8ab4c8;
+}}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:radial-gradient(circle at 50% -10%, #0b2640 0, var(--bg) 38%, #02050b 100%); color:var(--text); font-family:Segoe UI,Arial,sans-serif; }}
+.wrap {{ padding:18px; }}
+.shell {{ border:1px solid #9aa5ad; padding:10px; background:rgba(2,7,14,.92); box-shadow:0 0 32px rgba(0,229,255,.12) inset; }}
+.topbar {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:10px; }}
+h1 {{ margin:0; color:var(--cyan); font:800 30px Consolas,monospace; letter-spacing:0; }}
+.subtitle {{ color:white; font-weight:600; font-size:12px; margin-top:6px; }}
+.status-pill {{ color:{'#39ff88' if not result.failed_blocks and not result.corrupted_blocks else '#ff244f'}; font:800 14px Consolas,monospace; text-align:right; }}
+.grid {{ display:grid; gap:8px; }}
+.metrics {{ grid-template-columns:repeat(5, 1fr); }}
+.middle {{ grid-template-columns:1.2fr 1.55fr 1.1fr; margin-top:8px; }}
+.bottom {{ grid-template-columns:1fr 1fr 1fr; margin-top:8px; }}
+.panel,.metric {{ background:linear-gradient(135deg, rgba(9,23,39,.98), rgba(3,11,20,.98)); border:1px solid var(--line); padding:12px; }}
+.metric small,.label {{ display:block; color:#c0c7d1; font:700 12px Segoe UI,Arial; text-transform:uppercase; margin-bottom:6px; }}
+.metric b {{ display:block; color:var(--cyan); font:800 18px Consolas,monospace; overflow-wrap:anywhere; }}
+.metric .red,.bad {{ color:var(--red); }} .metric .green,.good {{ color:var(--green); }} .metric .yellow,.warn {{ color:var(--yellow); }}
+h2 {{ color:var(--cyan); font:800 16px Consolas,monospace; margin:0 0 10px; text-transform:uppercase; }}
+p {{ margin:4px 0; }} .tiny {{ color:var(--muted); font-size:12px; }}
+table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+th,td {{ border:1px solid var(--line); padding:6px; text-align:left; vertical-align:top; }}
+th {{ background:#0d1d31; color:var(--cyan); }}
+pre {{ white-space:pre-wrap; overflow-wrap:anywhere; font:11px Consolas,monospace; margin:0; color:#dcefff; }}
+ul {{ margin:0; padding-left:18px; }} li {{ margin:7px 0; }} li span {{ display:block; color:#dce6ed; }}
+.map {{ border:1px solid #3d617d; background:#121820; height:78px; display:flex; margin-top:8px; overflow:hidden; }}
+.seg {{ display:flex; align-items:center; justify-content:center; min-width:10px; text-align:center; font:800 12px Consolas,monospace; color:white; padding:4px; }}
+.seg-ok {{ width:{verified_pct:.4f}%; background:linear-gradient(135deg,#0f8a37,#123f23); border-right:1px solid #35ff7d; }}
+.seg-bad {{ width:{failed_pct:.4f}%; background:linear-gradient(135deg,#8e0017,#250006); border-right:1px solid #ff244f; }}
+.seg-untested {{ width:{untested_pct:.4f}%; background:linear-gradient(135deg,#2f3842,#111820); color:#d0d6dc; }}
+.legend {{ display:flex; gap:20px; margin-top:8px; font:12px Consolas,monospace; color:#dcefff; }}
+.dot {{ display:inline-block; width:18px; height:9px; margin-right:6px; border:1px solid #566; }}
+.okdot {{ background:#13883d; }} .baddot {{ background:#8e0017; }} .graydot {{ background:#3a424c; }}
+.warning {{ background:linear-gradient(135deg,#9d0018,#2a0007); border:1px solid #ff365f; text-align:center; padding:18px; color:white; }}
+.warning h2 {{ color:#ff365f; font-size:22px; }}
+.warning strong {{ display:block; color:white; font-size:20px; margin-top:10px; }}
+.evidence-icons {{ display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }}
+.evidence-icons div {{ border:1px solid #273e5e; padding:10px; min-height:54px; background:#091522; }}
+.evidence-icons b {{ color:var(--red); }}
+.footer-note {{ color:#cbd5df; border-top:1px solid var(--line); margin-top:10px; padding-top:8px; font-size:12px; }}
+</style></head><body><div class="wrap"><div class="shell">
+<div class="topbar"><div><h1>CYBER STORAGE VERIFIER <span style="font-size:16px">v{APP_VERSION}</span></h1>
+<div class="subtitle">Counterfeit capacity | Integrity validation | Metadata inspection | Resumable block verification</div></div>
+<div class="status-pill">{status_text}</div></div>
+<div class="grid metrics">
+<div class="metric"><small>Reported Capacity</small><b>{human_bytes(result.capacity_reported_bytes)}</b></div>
+<div class="metric"><small>Free Space</small><b class="green">{human_bytes(result.free_bytes)}</b></div>
+<div class="metric"><small>Test Coverage</small><b class="yellow">{result.coverage_percent:.4f}%</b></div>
+<div class="metric"><small>Current / Final Phase</small><b>{html.escape(result.current_phase or result.status or 'N/A')}</b></div>
+<div class="metric"><small>Risk Score</small><b class="{risk_class}">{result.risk_score} / 100</b></div>
+<div class="metric"><small>Processed Data</small><b>{human_bytes(result.processed_bytes)}</b></div>
+<div class="metric"><small>Verified Data</small><b class="green">{human_bytes(result.verified_bytes)}</b></div>
+<div class="metric"><small>Corrupted Data</small><b class="red">{human_bytes(result.corrupted_bytes)}</b></div>
+<div class="metric"><small>Failed Blocks</small><b class="yellow">{result.failed_blocks}</b></div>
+<div class="metric"><small>Read / Write Speed</small><b>{result.read_mb_s:.2f} / {result.write_mb_s:.2f} MB/s</b></div>
+</div>
+<div class="grid middle">
+<div class="panel"><h2>Scan Summary</h2>
+<p><span class="label">Started</span>{html.escape(result.started_at or 'N/A')}</p>
+<p><span class="label">Completed</span>{html.escape(result.completed_at or 'N/A')}</p>
+<p><span class="label">Target</span>{html.escape(result.root or 'N/A')}</p>
+<p><span class="label">Session</span>{html.escape(result.session_id or 'N/A')}</p>
+<p><span class="label">Interrupted</span>{'Yes' if result.scan_interrupted else 'No'} - {html.escape(result.interruption_reason or 'None')}</p></div>
+<div class="panel"><h2>Final Result</h2><p><b class="{risk_class}">{status_text}</b></p>
+<p>{html.escape(result.conclusion or 'N/A')}</p><p class="tiny">Finalization reason: {html.escape(result.finalization_reason or 'N/A')}</p></div>
+<div class="panel"><h2>Capacity Comparison</h2>
+<p>Windows reported: <b>{human_bytes(result.capacity_reported_bytes)}</b></p>
+<p>Advertised input: <b>{human_bytes(result.advertised_bytes) if result.advertised_bytes else 'N/A'}</b></p>
+<p>Estimated authentic usable capacity: <b class="green">{human_bytes(result.estimated_valid_capacity_bytes)}</b></p>
+<p>Corruption start offset: <b class="red">{human_bytes(result.corruption_start_offset) if result.first_corruption_block else 'N/A'}</b></p></div>
+</div>
+<div class="panel" style="margin-top:8px"><h2>Storage Map</h2>
+<div class="tiny">Green = verified/authentic range | Red = corrupted/failed range | Grey = untested/reported capacity</div>
+<div class="map"><div class="seg seg-ok">VERIFIED<br>{human_bytes(result.verified_bytes)}</div><div class="seg seg-bad">CORRUPTED / FAILED<br>{human_bytes(failed_bytes)}</div><div class="seg seg-untested">UNTESTED REPORTED CAPACITY<br>{human_bytes(max(0, cap - result.processed_bytes))}</div></div>
+<div class="legend"><span><i class="dot okdot"></i>Verified ranges</span><span><i class="dot baddot"></i>Corrupted / failed ranges</span><span><i class="dot graydot"></i>Untested reported capacity</span></div></div>
+<div class="grid middle">
+<div class="panel"><h2>Read/Write Verification</h2>
+<p>Blocks written: {result.blocks_tested}</p><p>Processed blocks: {result.processed_blocks}</p><p>Verified blocks: {result.verified_blocks}</p><p>Corrupted blocks: <b class="bad">{result.corrupted_blocks}</b></p>
+<p>Read failures: {result.read_failures}</p><p>Write failures: {result.write_failures}</p><p>Corruption percentage: {result.corruption_percent:.2f}%</p></div>
+<div class="panel"><h2>Key Findings</h2><ul>{issues}</ul></div>
+<div class="panel"><h2>Visual Corruption Evidence</h2><div class="evidence-icons">
+<div><b>Corrupted Files</b><br>{result.corrupted_blocks} corrupted blocks</div><div><b>Broken Photos</b><br>SHA256 mismatch evidence</div>
+<div><b>Read/Write Errors</b><br>{result.read_failures + result.write_failures} I/O failures</div><div><b>Damaged Sectors</b><br>{result.failed_blocks} failed blocks</div>
+</div></div></div>
+<div class="grid bottom">
+<div class="panel"><h2>Verified Ranges</h2><table><tr><th>Start Block</th><th>End Block</th><th>Start</th><th>End</th><th>Size</th></tr>{self.html_table_rows_for_ranges(verified_ranges_raw)}</table></div>
+<div class="panel"><h2>Failed / Corrupted Ranges</h2><table><tr><th>Start Block</th><th>End Block</th><th>Start</th><th>End</th><th>Size</th></tr>{self.html_table_rows_for_ranges(failed_ranges_raw)}</table></div>
+<div class="panel"><h2>Corruption Ranges</h2><table><tr><th>Start Block</th><th>End Block</th><th>Start</th><th>End</th><th>Size</th></tr>{self.html_table_rows_for_ranges(corruption_ranges_raw)}</table></div>
+</div>
+<div class="panel" style="margin-top:8px"><h2>SHA256 Mismatch Evidence</h2><table><tr><th>Block</th><th>Offset</th><th>Expected SHA256</th><th>Actual / Evidence Details</th><th>Result</th></tr>{mismatch_rows}</table></div>
+<div class="grid bottom">
+<div class="panel"><h2>Live Activity Log Preview</h2><pre>{log_preview}</pre></div>
+<div class="panel"><h2>Risk Indicators</h2><ul>{risk_indicators}</ul><h2 style="margin-top:12px">Speed Drops</h2><ul>{speed_drops}</ul></div>
+<div class="panel"><h2>Forensic Analysis Summary</h2><p>{html.escape(forensic_summary)}</p>
+<p>Device metadata:</p><pre>{html.escape(json.dumps(result.disk_metadata or {}, indent=2))}</pre></div>
+</div>
+<div class="panel" style="margin-top:8px"><h2>Block Report Preview</h2><table><tr><th>#</th><th>Offset</th><th>Size</th><th>Write</th><th>Verify</th><th>Write MB/s</th><th>Read MB/s</th><th>Error</th></tr>{block_rows}</table></div>
+<div class="warning" style="margin-top:8px"><h2>FINAL WARNING</h2><p>{html.escape(result.conclusion or 'N/A')}</p><strong>{html.escape(warning_text)}</strong></div>
+<div class="footer-note">Generated by {APP_NAME} v{APP_VERSION}. TXT, JSON, CSV, HTML, and optional PDF reports preserve the same scan evidence without modifying scan logic.</div>
+</div></div></body></html>"""
 
 
 class CyberStorageVerifierApp(tk.Tk):
@@ -2067,15 +2237,312 @@ class CyberStorageVerifierApp(tk.Tk):
     def create_reports_tab(self):
         tab = self.tabs["Reports"]
         tab.grid_columnconfigure(0, weight=1)
-        panel = self.make_panel(tab)
-        panel.grid(row=0, column=0, sticky="new", padx=8, pady=8)
-        panel.grid_columnconfigure((0, 1, 2, 3), weight=1)
-        self.section_title(panel, "REPORTS").grid(row=0, column=0, columnspan=4, sticky="w", padx=14, pady=(12, 8))
-        ttk.Button(panel, text="Open Text Report", style="Cyber.TButton", command=lambda: self.open_path("report_path")).grid(row=1, column=0, sticky="ew", padx=8, pady=12)
-        ttk.Button(panel, text="Open JSON Report", style="Cyber.TButton", command=lambda: self.open_path("json_report_path")).grid(row=1, column=1, sticky="ew", padx=8, pady=12)
-        ttk.Button(panel, text="Open CSV Block Report", style="Cyber.TButton", command=lambda: self.open_path("csv_report_path")).grid(row=1, column=2, sticky="ew", padx=8, pady=12)
-        ttk.Button(panel, text="Open HTML Report", style="Cyber.TButton", command=lambda: self.open_path("html_report_path")).grid(row=1, column=3, sticky="ew", padx=8, pady=12)
-        ttk.Button(panel, text="Open Reports Folder", style="Cyber.TButton", command=lambda: self.open_file(str(ensure_reports_dir()))).grid(row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 12))
+        tab.grid_rowconfigure(1, weight=1)
+
+        toolbar = self.make_panel(tab)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        toolbar.grid_columnconfigure(tuple(range(6)), weight=1)
+        self.section_title(toolbar, "FORENSIC REPORT DASHBOARD").grid(row=0, column=0, columnspan=6, sticky="w", padx=14, pady=(12, 8))
+        ttk.Button(toolbar, text="Open Text Report", style="Cyber.TButton", command=lambda: self.open_path("report_path")).grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 12))
+        ttk.Button(toolbar, text="Open JSON Report", style="Cyber.TButton", command=lambda: self.open_path("json_report_path")).grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 12))
+        ttk.Button(toolbar, text="Open CSV Block Report", style="Cyber.TButton", command=lambda: self.open_path("csv_report_path")).grid(row=1, column=2, sticky="ew", padx=6, pady=(0, 12))
+        ttk.Button(toolbar, text="Open HTML Report", style="Cyber.TButton", command=lambda: self.open_path("html_report_path")).grid(row=1, column=3, sticky="ew", padx=6, pady=(0, 12))
+        ttk.Button(toolbar, text="Open PDF Report", style="Cyber.TButton", command=self.open_pdf_report).grid(row=1, column=4, sticky="ew", padx=6, pady=(0, 12))
+        ttk.Button(toolbar, text="Open Reports Folder", style="Cyber.TButton", command=lambda: self.open_file(str(ensure_reports_dir()))).grid(row=1, column=5, sticky="ew", padx=6, pady=(0, 12))
+
+        outer = self.make_panel(tab)
+        outer.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        canvas = tk.Canvas(outer, bg=CYBER_BG, highlightthickness=0)
+        scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style="Cyber.Vertical.TScrollbar")
+        self.reports_dashboard = tk.Frame(canvas, bg=CYBER_BG)
+        self.reports_canvas_window = canvas.create_window((0, 0), window=self.reports_dashboard, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.reports_canvas = canvas
+
+        def resize_dashboard(_event=None):
+            canvas.itemconfigure(self.reports_canvas_window, width=canvas.winfo_width())
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        self.reports_dashboard.bind("<Configure>", resize_dashboard)
+        canvas.bind("<Configure>", resize_dashboard)
+        self.build_report_dashboard_widgets()
+        self.refresh_report_dashboard()
+
+    def report_panel(self, parent, title):
+        panel = self.make_panel(parent)
+        self.section_title(panel, title).pack(anchor="w", padx=12, pady=(10, 6))
+        return panel
+
+    def report_metric(self, parent, title, value="N/A", color=CYBER_CYAN):
+        frame = self.make_card(parent, title, value, color)
+        return frame
+
+    def build_report_dashboard_widgets(self):
+        root = self.reports_dashboard
+        root.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+        self.report_cards = {}
+        metrics = [
+            ("Selected Drive", CYBER_CYAN),
+            ("Reported Capacity", CYBER_PURPLE),
+            ("Free Space", CYBER_GREEN),
+            ("Test Coverage", CYBER_YELLOW),
+            ("Current Phase", CYBER_CYAN),
+            ("Risk Score", CYBER_RED),
+            ("Processed", CYBER_CYAN),
+            ("Verified", CYBER_GREEN),
+            ("Corrupted Bytes", CYBER_RED),
+            ("Failed Blocks", CYBER_ORANGE),
+        ]
+        for idx, (title, color) in enumerate(metrics):
+            card = self.report_metric(root, title, "N/A", color)
+            card.grid(row=0 + idx // 5, column=idx % 5, sticky="ew", padx=5, pady=5)
+            self.report_cards[title] = card
+
+        summary = self.report_panel(root, "SCAN SUMMARY")
+        summary.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+        self.report_summary_text = self.make_text(summary, height=9)
+        self.report_summary_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        result_panel = self.report_panel(root, "FINAL RESULT")
+        result_panel.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.report_result_text = self.make_text(result_panel, height=9)
+        self.report_result_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        capacity = self.report_panel(root, "CAPACITY COMPARISON")
+        capacity.grid(row=2, column=3, sticky="nsew", padx=5, pady=5)
+        self.report_capacity_text = self.make_text(capacity, height=9)
+        self.report_capacity_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        findings = self.report_panel(root, "KEY FINDINGS")
+        findings.grid(row=2, column=4, sticky="nsew", padx=5, pady=5)
+        self.report_findings_text = self.make_text(findings, height=9)
+        self.report_findings_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        storage = self.report_panel(root, "STORAGE MAP")
+        storage.grid(row=3, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
+        self.report_storage_canvas = tk.Canvas(storage, height=130, bg="#07101D", highlightthickness=1, highlightbackground=CYBER_BORDER)
+        self.report_storage_canvas.pack(fill="x", padx=12, pady=(0, 12))
+
+        verification = self.report_panel(root, "READ/WRITE VERIFICATION")
+        verification.grid(row=4, column=0, sticky="nsew", padx=5, pady=5)
+        self.report_verification_text = self.make_text(verification, height=12)
+        self.report_verification_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        evidence = self.report_panel(root, "SHA256 MISMATCH EVIDENCE")
+        evidence.grid(row=4, column=1, columnspan=3, sticky="nsew", padx=5, pady=5)
+        self.report_evidence_text = self.make_text(evidence, height=12)
+        self.report_evidence_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        visual = self.report_panel(root, "VISUAL CORRUPTION / RISK INDICATORS")
+        visual.grid(row=4, column=4, sticky="nsew", padx=5, pady=5)
+        self.report_risk_text = self.make_text(visual, height=12)
+        self.report_risk_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        log_panel = self.report_panel(root, "LIVE ACTIVITY LOG PREVIEW")
+        log_panel.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.report_log_preview = self.make_text(log_panel, height=10)
+        self.report_log_preview.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        ranges = self.report_panel(root, "VERIFIED / FAILED / CORRUPTION RANGES")
+        ranges.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.report_ranges_text = self.make_text(ranges, height=10)
+        self.report_ranges_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        warning = self.make_panel(root)
+        warning.grid(row=5, column=4, sticky="nsew", padx=5, pady=5)
+        tk.Label(warning, text="FINAL WARNING", bg=CYBER_PANEL, fg=CYBER_RED, font=("Consolas", 18, "bold")).pack(anchor="center", padx=12, pady=(18, 8))
+        self.report_warning_var = tk.StringVar(value="Run or open a scan report to review forensic evidence.")
+        tk.Label(warning, textvariable=self.report_warning_var, bg="#240006", fg="#FFFFFF", font=("Consolas", 14, "bold"), wraplength=260, justify="center", padx=12, pady=14).pack(fill="x", padx=12, pady=(0, 18))
+
+    def report_card_set(self, name, value, color=None):
+        if hasattr(self, "report_cards") and name in self.report_cards:
+            self.report_cards[name].value_label.config(text=value)
+            if color:
+                self.report_cards[name].value_label.config(fg=color)
+
+    def refresh_report_dashboard(self):
+        if not hasattr(self, "report_cards"):
+            return
+        res = self.last_result
+        if not res:
+            self.set_text(self.report_summary_text, "No scan report loaded yet.\nRun a scan or open a report after completion.")
+            self.set_text(self.report_result_text, "Final result: N/A")
+            self.set_text(self.report_capacity_text, "Capacity data: N/A")
+            self.set_text(self.report_findings_text, "Findings: N/A")
+            self.set_text(self.report_verification_text, "Verification data: N/A")
+            self.set_text(self.report_evidence_text, "SHA256 mismatch evidence: N/A")
+            self.set_text(self.report_risk_text, "Risk indicators: N/A")
+            self.set_text(self.report_log_preview, "Live activity log preview: N/A")
+            self.set_text(self.report_ranges_text, "Ranges: N/A")
+            self.draw_report_storage_map(None)
+            return
+
+        risk_color = CYBER_RED if res.risk_score >= 70 or res.corrupted_blocks else CYBER_ORANGE if res.risk_score >= 30 else CYBER_GREEN
+        self.report_card_set("Selected Drive", res.root or "N/A", CYBER_CYAN)
+        self.report_card_set("Reported Capacity", human_bytes(res.capacity_reported_bytes), CYBER_PURPLE)
+        self.report_card_set("Free Space", human_bytes(res.free_bytes), CYBER_GREEN)
+        self.report_card_set("Test Coverage", f"{res.coverage_percent:.4f}%", CYBER_YELLOW)
+        self.report_card_set("Current Phase", res.current_phase or res.status or "N/A", CYBER_CYAN)
+        self.report_card_set("Risk Score", f"{res.risk_score} / 100", risk_color)
+        self.report_card_set("Processed", human_bytes(res.processed_bytes), CYBER_CYAN)
+        self.report_card_set("Verified", human_bytes(res.verified_bytes), CYBER_GREEN)
+        self.report_card_set("Corrupted Bytes", human_bytes(res.corrupted_bytes), CYBER_RED)
+        self.report_card_set("Failed Blocks", str(res.failed_blocks), CYBER_ORANGE)
+
+        self.set_text(
+            self.report_summary_text,
+            "\n".join(
+                [
+                    f"Started: {res.started_at or 'N/A'}",
+                    f"Completed: {res.completed_at or 'N/A'}",
+                    f"Target: {res.root or 'N/A'}",
+                    f"Session: {res.session_id or 'N/A'}",
+                    f"Scan Interrupted: {'Yes' if res.scan_interrupted else 'No'}",
+                    f"Interruption Reason: {res.interruption_reason or 'None'}",
+                ]
+            ),
+        )
+        self.set_text(
+            self.report_result_text,
+            "\n".join(
+                [
+                    f"Status: {res.status or 'N/A'}",
+                    f"Finalization Reason: {res.finalization_reason or 'N/A'}",
+                    f"Risk Score: {res.risk_score}/100",
+                    "",
+                    res.conclusion or "N/A",
+                ]
+            ),
+        )
+        self.set_text(
+            self.report_capacity_text,
+            "\n".join(
+                [
+                    f"Windows Reported Capacity: {human_bytes(res.capacity_reported_bytes)}",
+                    f"Advertised Capacity Input: {human_bytes(res.advertised_bytes) if res.advertised_bytes else 'N/A'}",
+                    f"Used Space: {human_bytes(res.used_bytes)}",
+                    f"Free Space: {human_bytes(res.free_bytes)}",
+                    f"Estimated Authentic Usable Capacity: {human_bytes(res.estimated_valid_capacity_bytes)}",
+                    f"Corruption Start Offset: {human_bytes(res.corruption_start_offset) if res.first_corruption_block else 'N/A'}",
+                ]
+            ),
+        )
+        findings = []
+        if res.issues:
+            for issue in res.issues[:8]:
+                findings.append(f"[{issue.severity}] {issue.title}")
+                findings.append(f"  {issue.detail}")
+        else:
+            findings.append("No major suspicious findings were detected.")
+        self.set_text(self.report_findings_text, "\n".join(findings))
+        self.set_text(
+            self.report_verification_text,
+            "\n".join(
+                [
+                    f"Blocks Written: {res.blocks_tested}",
+                    f"Processed Blocks: {res.processed_blocks}",
+                    f"Verified Blocks: {res.verified_blocks}",
+                    f"Failed Blocks: {res.failed_blocks}",
+                    f"Verified Bytes: {human_bytes(res.verified_bytes)}",
+                    f"Corrupted Bytes: {human_bytes(res.corrupted_bytes)}",
+                    f"Failed Bytes: {human_bytes(res.failed_bytes)}",
+                    f"Processed Bytes: {human_bytes(res.processed_bytes)}",
+                    f"Read Speed: {res.read_mb_s:.2f} MB/s",
+                    f"Write Speed: {res.write_mb_s:.2f} MB/s",
+                    f"Speed Variation: {res.speed_variation_percent:.1f}%",
+                    f"Read Failures: {res.read_failures}",
+                    f"Write Failures: {res.write_failures}",
+                    f"Corruption Percent: {res.corruption_percent:.2f}%",
+                ]
+            ),
+        )
+        mismatches = [b for b in (self.scanner.blocks if self.scanner else []) if b.verification_result == "corrupt"]
+        evidence_lines = ["Block | Offset | Evidence"]
+        evidence_lines += [
+            f"{b.index + 1} | {human_bytes(b.offset)} | {(b.error_details or 'SHA256 mismatch')[:160]}"
+            for b in mismatches[:80]
+        ] or ["N/A"]
+        self.set_text(self.report_evidence_text, "\n".join(evidence_lines))
+        risk_lines = [
+            "Visual evidence indicators:",
+            f"- Corrupted files: {res.corrupted_blocks} corrupted blocks",
+            f"- Read/write errors: {res.read_failures + res.write_failures}",
+            f"- Damaged sectors: {res.failed_blocks} failed blocks",
+            "",
+            "Risk indicators:",
+        ]
+        risk_lines += [f"- {x}" for x in res.fake_capacity_indicators] or ["- N/A"]
+        self.set_text(self.report_risk_text, "\n".join(risk_lines))
+        self.set_text(self.report_log_preview, self.text_widget(self.log_text).get("1.0", tk.END).strip()[-4000:] or "N/A")
+        self.set_text(self.report_ranges_text, self.format_report_ranges_for_ui(res))
+        warning = "DO NOT TRUST THIS DEVICE WITH IMPORTANT DATA" if res.risk_score >= 70 or res.corrupted_blocks or res.failed_blocks else "Review coverage before trusting this device"
+        self.report_warning_var.set(warning)
+        self.draw_report_storage_map(res)
+
+    def format_report_ranges_for_ui(self, res):
+        blocks = self.scanner.blocks if self.scanner else []
+        if not blocks:
+            return "N/A"
+        scanner = self.scanner
+        sections = []
+        for title, predicate in (
+            ("VERIFIED RANGES", lambda b: b.verification_result == "ok"),
+            ("FAILED / CORRUPTED RANGES", lambda b: b.verification_result in ("corrupt", "read_failed") or b.write_status == "failed"),
+            ("CORRUPTION RANGES", lambda b: b.verification_result == "corrupt"),
+        ):
+            sections.append(title)
+            ranges = scanner.block_ranges(predicate)
+            if ranges:
+                for item in ranges[:20]:
+                    sections.append(f"  Blocks {item['start_block']}-{item['end_block']} | {item['human_start_offset']} to {item['human_end_offset']} | {item['human_size']}")
+            else:
+                sections.append("  N/A")
+            sections.append("")
+        return "\n".join(sections)
+
+    def draw_report_storage_map(self, res):
+        if not hasattr(self, "report_storage_canvas"):
+            return
+        c = self.report_storage_canvas
+        c.delete("all")
+        width = max(1, c.winfo_width() or 1000)
+        pad = 24
+        x = pad
+        y = 42
+        h = 42
+        w = max(1, width - pad * 2)
+        if not res:
+            c.create_text(pad, 18, anchor="w", fill=CYBER_MUTED, font=("Consolas", 10), text="Storage map unavailable until a scan report exists.")
+            c.create_rectangle(x, y, x + w, y + h, outline=CYBER_BORDER, fill="#111820")
+            return
+        cap = max(1, res.capacity_reported_bytes or res.test_size_bytes or res.processed_bytes or 1)
+        verified_w = w * min(1.0, res.verified_bytes / cap)
+        failed_w = w * min(1.0, max(res.failed_bytes, res.corrupted_bytes) / cap)
+        if res.verified_bytes and verified_w < 8:
+            verified_w = 8
+        if max(res.failed_bytes, res.corrupted_bytes) and failed_w < 8:
+            failed_w = 8
+        if verified_w + failed_w > w:
+            scale = w / (verified_w + failed_w)
+            verified_w *= scale
+            failed_w *= scale
+        untested_w = max(0, w - verified_w - failed_w)
+        c.create_text(x, 18, anchor="w", fill=CYBER_CYAN, font=("Consolas", 11, "bold"), text=f"STORAGE MAP - TEST COVERAGE {res.coverage_percent:.4f}% OF REPORTED CAPACITY")
+        c.create_rectangle(x, y, x + verified_w, y + h, outline=CYBER_GREEN, fill="#0B6B31")
+        c.create_text(x + verified_w / 2, y + h / 2, fill="white", font=("Consolas", 9, "bold"), text=f"VERIFIED\n{human_bytes(res.verified_bytes)}")
+        x2 = x + verified_w
+        c.create_rectangle(x2, y, x2 + failed_w, y + h, outline=CYBER_RED, fill="#790012")
+        c.create_text(x2 + failed_w / 2, y + h / 2, fill="white", font=("Consolas", 9, "bold"), text=f"CORRUPTED / FAILED\n{human_bytes(max(res.failed_bytes, res.corrupted_bytes))}")
+        x3 = x2 + failed_w
+        c.create_rectangle(x3, y, x3 + untested_w, y + h, outline="#475569", fill="#202833")
+        c.create_text(x3 + untested_w / 2, y + h / 2, fill="#E5E7EB", font=("Consolas", 9, "bold"), text=f"UNTESTED\n{human_bytes(max(0, cap - res.processed_bytes))}")
+        c.create_text(x, y + h + 24, anchor="w", fill=CYBER_GREEN, font=("Consolas", 9), text="Green = verified/authentic range")
+        c.create_text(x + 270, y + h + 24, anchor="w", fill=CYBER_RED, font=("Consolas", 9), text="Red = corrupted/failed range")
+        c.create_text(x + 575, y + h + 24, anchor="w", fill=CYBER_MUTED, font=("Consolas", 9), text="Grey = untested/reported capacity")
 
     def create_history_tab(self):
         tab = self.tabs["Scan History"]
@@ -2949,6 +3416,24 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         else:
             messagebox.showinfo("Report", "No report generated yet.")
 
+    def open_pdf_report(self):
+        if self.last_result and self.last_result.pdf_report_path and Path(self.last_result.pdf_report_path).exists():
+            self.open_file(self.last_result.pdf_report_path)
+            return
+        if self.last_result:
+            messagebox.showinfo(
+                "PDF Report",
+                "No PDF report was generated for this scan. Install WeasyPrint, or install pdfkit with wkhtmltopdf, then run or export the report again. The HTML report remains available for browser print-to-PDF.",
+            )
+            return
+        entries = load_history()
+        for item in entries:
+            path = item.get("pdf_report_path")
+            if path and Path(path).exists():
+                self.open_file(path)
+                return
+        messagebox.showinfo("PDF Report", "No PDF report has been generated yet.")
+
     def open_latest_report(self):
         if self.last_result and self.last_result.report_path:
             self.open_file(self.last_result.report_path)
@@ -3004,6 +3489,7 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         self.update_device_text(res)
         self.update_findings_text(res)
         self.update_scan_visualization(asdict(res))
+        self.refresh_report_dashboard()
         self.refresh_history()
         self.refresh_sessions()
 
@@ -3048,6 +3534,8 @@ li{{margin:7px 0}} code{{color:#39FF88}}
                         self.header_status.config(text="COMPLETED", fg=CYBER_GREEN)
                 else:
                     self.append_text(self.log_text, str(msg) + "\n")
+                    if hasattr(self, "report_log_preview"):
+                        self.set_text(self.report_log_preview, self.text_widget(self.log_text).get("1.0", tk.END).strip()[-4000:] or "N/A")
         except queue.Empty:
             pass
         try:
@@ -3171,6 +3659,8 @@ li{{margin:7px 0}} code{{color:#39FF88}}
             lines.append(f"{item.get('completed_at')} | {item.get('status')} | Risk {item.get('risk_score')} | {item.get('target')}")
             lines.append(f"  Mode: {item.get('scan_mode')} | Test: {item.get('test_size')}")
             lines.append(f"  Report: {item.get('report_path')}")
+            if item.get("pdf_report_path"):
+                lines.append(f"  PDF: {item.get('pdf_report_path')}")
             lines.append("")
         self.set_text(self.history_text, "\n".join(lines) if lines else "No completed scan history yet.\n")
 
