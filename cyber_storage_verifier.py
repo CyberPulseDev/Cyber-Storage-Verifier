@@ -16,6 +16,7 @@ import csv
 import ctypes
 import hashlib
 import html
+import importlib.util
 import json
 import logging
 import math
@@ -40,14 +41,15 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "Cyber Storage Verifier"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 TEST_DIR_NAME = "_csv_temp_integrity_test"
 SESSION_PREFIX = "session_"
 CHECKPOINT_NAME = "checkpoint.json"
 BLOCK_REPORT_NAME = "block_report.csv"
 LOG_FILE_NAME = "scanner.log"
 REPORT_DIR_NAME = "CyberStorageVerifier_Reports"
-HISTORY_FILE = Path.home() / "Documents" / REPORT_DIR_NAME / "scan_history.json"
+METADATA_CACHE_TTL_SECONDS = 90
+MAX_TEXT_WIDGET_CHARS = 180000
 
 CYBER_BG = "#070B14"
 CYBER_PANEL = "#0B1220"
@@ -86,6 +88,46 @@ SCAN_MODES = (
     "Quick Health",
 )
 FLUSH_POLICIES = ("Fast", "Balanced", "Deep")
+
+
+def is_frozen_app() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_base_dir() -> Path:
+    if is_frozen_app():
+        return Path(sys.executable).resolve().parent
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def resource_path(relative_path) -> str:
+    rel = Path(relative_path)
+    if rel.is_absolute():
+        return str(rel)
+    base = Path(getattr(sys, "_MEIPASS", app_base_dir()))
+    return str(base / rel)
+
+
+def external_runtime_dir() -> Path:
+    return app_base_dir() / "tools"
+
+
+def writable_reports_root() -> Path:
+    return Path.home() / "Documents" / REPORT_DIR_NAME
+
+
+def app_cache_dir() -> Path:
+    cache = ensure_reports_dir() / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+APP_ICON_PATH = resource_path("assets/app.ico")
+HISTORY_FILE = writable_reports_root() / "scan_history.json"
+SETTINGS_FILE = writable_reports_root() / "app_settings.json"
 
 
 def human_bytes(num: float) -> str:
@@ -288,19 +330,50 @@ $obj | ConvertTo-Json -Compress -Depth 5
     return {}, err or "PowerShell disk mapping unavailable."
 
 
+_DISK_METADATA_CACHE = {}
+
+
+def get_disk_metadata_for_drive_cached(root: str, ttl=METADATA_CACHE_TTL_SECONDS):
+    key = normalize_drive_root(root).upper() if isinstance(root, str) else str(root)
+    now = time.time()
+    cached = _DISK_METADATA_CACHE.get(key)
+    if cached and now - cached.get("timestamp", 0) <= ttl:
+        return dict(cached.get("metadata", {})), cached.get("warning")
+    metadata, warning = get_disk_metadata_for_drive(root)
+    _DISK_METADATA_CACHE[key] = {"timestamp": now, "metadata": dict(metadata or {}), "warning": warning}
+    return metadata, warning
+
+
 def smartctl_available():
-    candidates = [
-        "smartctl.exe",
-        "smartctl",
-        r"C:\Program Files\smartmontools\bin\smartctl.exe",
-        r"C:\Program Files (x86)\smartmontools\bin\smartctl.exe",
+    names = ["smartctl.exe", "smartctl-nc.exe", "smartctl"]
+    search_dirs = [
+        external_runtime_dir(),
+        app_base_dir() / "tools",
+        app_base_dir(),
+        Path(resource_path("tools")),
+        Path(resource_path(".")),
+        Path.cwd(),
+        Path(r"C:\Program Files\smartmontools\bin"),
+        Path(r"C:\Program Files (x86)\smartmontools\bin"),
     ]
-    for exe in candidates:
-        path = shutil.which(exe)
+    seen = set()
+    for folder in search_dirs:
+        try:
+            folder = Path(folder)
+            key = str(folder.resolve()).lower()
+        except Exception:
+            key = str(folder).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        for name in names:
+            candidate = folder / name
+            if candidate.is_file():
+                return str(candidate)
+    for name in names:
+        path = shutil.which(name)
         if path:
             return path
-        if os.path.isfile(exe):
-            return exe
     return None
 
 
@@ -322,13 +395,46 @@ def collect_smartctl_summary():
 
 
 def ensure_reports_dir() -> Path:
-    reports_dir = Path.home() / "Documents" / REPORT_DIR_NAME
+    reports_dir = writable_reports_root()
     try:
         reports_dir.mkdir(parents=True, exist_ok=True)
+        probe = reports_dir / ".write_test.tmp"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
     except Exception:
         reports_dir = Path(tempfile.gettempdir()) / REPORT_DIR_NAME
         reports_dir.mkdir(parents=True, exist_ok=True)
     return reports_dir
+
+
+def pdf_engine_available():
+    engines = []
+    if importlib.util.find_spec("weasyprint") is not None:
+        engines.append("WeasyPrint installed")
+    if importlib.util.find_spec("pdfkit") is not None:
+        engines.append("pdfkit installed")
+    return engines
+
+
+def check_packaged_runtime():
+    reports_dir = ensure_reports_dir()
+    smartctl_path = smartctl_available()
+    icon_path = Path(APP_ICON_PATH)
+    engines = pdf_engine_available()
+    info = {
+        "frozen": is_frozen_app(),
+        "app_base_dir": str(app_base_dir()),
+        "pyinstaller_meipass": str(getattr(sys, "_MEIPASS", "")),
+        "external_runtime_dir": str(external_runtime_dir()),
+        "reports_dir": str(reports_dir),
+        "cache_dir": str(app_cache_dir()),
+        "smartctl_path": smartctl_path or "Not detected",
+        "icon_detected": icon_path.is_file(),
+        "icon_path": str(icon_path),
+        "pdf_engines": engines or ["Unavailable"],
+    }
+    logging.info("Runtime self-check: %s", json.dumps(info, indent=2))
+    return info
 
 
 def append_history(entry: dict):
@@ -340,6 +446,21 @@ def append_history(entry: dict):
             existing = json.loads(history_path.read_text(encoding="utf-8"))
             if not isinstance(existing, list):
                 existing = []
+        entry_key = (
+            entry.get("completed_at"),
+            entry.get("target"),
+            entry.get("health_status"),
+            entry.get("health_risk_score"),
+        )
+        existing = [
+            item for item in existing
+            if (
+                item.get("completed_at"),
+                item.get("target"),
+                item.get("health_status"),
+                item.get("health_risk_score"),
+            ) != entry_key
+        ]
         existing.insert(0, entry)
         history_path.write_text(json.dumps(existing[:200], indent=2), encoding="utf-8")
     except Exception:
@@ -355,6 +476,222 @@ def load_history():
     except Exception:
         logging.exception("Failed to load history")
     return []
+
+
+def append_health_history(entry: dict):
+    reports_dir = ensure_reports_dir()
+    history_path = reports_dir / "health_history.json"
+    try:
+        existing = []
+        if history_path.exists():
+            existing = json.loads(history_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        existing.insert(0, entry)
+        history_path.write_text(json.dumps(existing[:200], indent=2), encoding="utf-8")
+    except Exception:
+        logging.exception("Failed to write health history")
+
+
+def load_health_history():
+    history_path = ensure_reports_dir() / "health_history.json"
+    try:
+        if history_path.exists():
+            data = json.loads(history_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+    except Exception:
+        logging.exception("Failed to load health history")
+    return []
+
+
+def normalize_drive_root(path):
+    if not path:
+        return path
+    if os.name == "nt":
+        drive, _ = os.path.splitdrive(os.path.abspath(path))
+        return f"{drive}\\" if drive else path
+    return path
+
+
+def clean_identity_value(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in ("unknown", "none", "null", "0"):
+        return ""
+    return text
+
+
+def classify_drive_badge(drive_type, metadata):
+    meta = metadata or {}
+    bus = clean_identity_value(meta.get("BusType") or meta.get("PhysicalBusType")).upper()
+    media = clean_identity_value(meta.get("PhysicalMediaType") or meta.get("MediaType")).upper()
+    friendly = clean_identity_value(meta.get("PhysicalFriendlyName") or meta.get("FriendlyName") or meta.get("Model")).upper()
+    dtype = (drive_type or "").upper()
+    combined = f"{bus} {media} {friendly} {dtype}"
+    if "NVME" in combined:
+        return "NVMe SSD"
+    if "USB" in combined:
+        if "HDD" in combined or "HARD" in combined:
+            return "USB HDD"
+        if "SSD" in combined:
+            return "USB SSD"
+        return "USB Removable" if "REMOVABLE" in combined else "USB Storage"
+    if "SD" in combined and ("REMOVABLE" in combined or "CARD" in combined):
+        return "SD Card / Removable"
+    if "SATA" in combined or "ATA" in combined:
+        if "SSD" in combined or "SOLID" in combined:
+            return "SATA SSD"
+        if "HDD" in combined or "HARD" in combined:
+            return "SATA HDD"
+        return "SATA Storage"
+    if "SSD" in combined or "SOLID" in combined:
+        return "SSD"
+    if "HDD" in combined or "HARD" in combined:
+        return "HDD"
+    if "REMOVABLE" in combined:
+        return "Removable"
+    return drive_type or "Unknown"
+
+
+def preferred_drive_name(metadata, volume_info):
+    meta = metadata or {}
+    vol = volume_info or {}
+    manufacturer = clean_identity_value(meta.get("Manufacturer"))
+    model = clean_identity_value(meta.get("Model"))
+    candidates = [
+        clean_identity_value(meta.get("PhysicalFriendlyName")),
+        clean_identity_value(meta.get("FriendlyName")),
+        model,
+        f"{manufacturer} {model}".strip() if manufacturer or model else "",
+        clean_identity_value(vol.get("volume_name")) if clean_identity_value(vol.get("volume_name")).lower() != "none" else "",
+    ]
+    for item in candidates:
+        if item:
+            return item
+    return "Unknown Storage Device"
+
+
+def build_drive_display_name(root, metadata=None, volume_info=None, usage=None, drive_type=None):
+    letter = root[:2].upper() if os.name == "nt" and root else root
+    name = preferred_drive_name(metadata, volume_info)
+    capacity = human_bytes(getattr(usage, "total", 0) if usage else 0)
+    badge = classify_drive_badge(drive_type or get_drive_type(root), metadata or {})
+    return f"({letter}) {name} — {capacity} — {badge}"
+
+
+def discover_drive_identities_quick():
+    identities = []
+    roots = get_windows_drives()
+    if not roots and os.name != "nt":
+        roots = ["/"]
+    for root in roots:
+        volume_info = {}
+        usage = None
+        drive_type = "Unknown"
+        warning = ""
+        try:
+            drive_type = get_drive_type(root)
+        except Exception as exc:
+            warning = str(exc)
+        try:
+            volume_info = get_volume_info(root)
+        except Exception as exc:
+            warning = warning or str(exc)
+        try:
+            usage = shutil.disk_usage(root)
+        except Exception as exc:
+            warning = warning or str(exc)
+        display = build_drive_display_name(root, {}, volume_info, usage, drive_type)
+        identities.append(
+            {
+                "root": root,
+                "display": display,
+                "volume_info": volume_info or {},
+                "metadata": {},
+                "usage": {
+                    "total": getattr(usage, "total", 0) if usage else 0,
+                    "used": getattr(usage, "used", 0) if usage else 0,
+                    "free": getattr(usage, "free", 0) if usage else 0,
+                },
+                "drive_type": drive_type,
+                "badge": classify_drive_badge(drive_type, {}),
+                "warning": warning or "Physical disk metadata is still loading.",
+                "quick": True,
+            }
+        )
+    return identities
+
+
+def discover_drive_identities():
+    identities = []
+    for root in get_windows_drives():
+        volume_info = {}
+        metadata = {}
+        usage = None
+        warning = ""
+        drive_type = "Unknown"
+        try:
+            drive_type = get_drive_type(root)
+        except Exception as exc:
+            warning = str(exc)
+        try:
+            volume_info = get_volume_info(root)
+        except Exception as exc:
+            warning = warning or str(exc)
+        try:
+            usage = shutil.disk_usage(root)
+        except Exception as exc:
+            warning = warning or str(exc)
+        try:
+            metadata, meta_warning = get_disk_metadata_for_drive_cached(root)
+            warning = warning or (meta_warning or "")
+        except Exception as exc:
+            metadata = {}
+            warning = warning or str(exc)
+        display = build_drive_display_name(root, metadata, volume_info, usage, drive_type)
+        identities.append(
+            {
+                "root": root,
+                "display": display,
+                "volume_info": volume_info or {},
+                "metadata": metadata or {},
+                "usage": {
+                    "total": getattr(usage, "total", 0) if usage else 0,
+                    "used": getattr(usage, "used", 0) if usage else 0,
+                    "free": getattr(usage, "free", 0) if usage else 0,
+                },
+                "drive_type": drive_type,
+                "badge": classify_drive_badge(drive_type, metadata or {}),
+                "warning": warning,
+            }
+        )
+    if not identities and os.name != "nt":
+        root = "/"
+        try:
+            usage = shutil.disk_usage(root)
+        except Exception:
+            usage = None
+        identities.append(
+            {
+                "root": root,
+                "display": build_drive_display_name(root, {}, {}, usage, "Unknown"),
+                "volume_info": {},
+                "metadata": {},
+                "usage": {
+                    "total": getattr(usage, "total", 0) if usage else 0,
+                    "used": getattr(usage, "used", 0) if usage else 0,
+                    "free": getattr(usage, "free", 0) if usage else 0,
+                },
+                "drive_type": "Unknown",
+                "badge": "Unknown",
+                "warning": "Windows drive identity metadata is unavailable on this platform.",
+            }
+        )
+    return identities
+
+
+LAST_HEALTH_SUMMARY = {}
 
 
 @dataclass
@@ -443,6 +780,79 @@ class ScanResult:
     scan_mode: str = "Balanced Scan"
     flush_policy: str = "Balanced"
     conclusion: str = ""
+    health_diagnostics: dict = field(default_factory=dict)
+
+
+@dataclass
+class HealthDiagnosticResult:
+    target: str = ""
+    started_at: str = field(default_factory=now_stamp)
+    completed_at: str = ""
+    health_status: str = "Not Checked"
+    smart_status: str = "Not Checked"
+    windows_health_status: str = "Not Checked"
+    temperature: str = "Unknown"
+    wear_age: str = "Unknown"
+    read_stability_status: str = "Not Checked"
+    health_risk_score: int = 0
+    recommendation: str = "No health diagnostics have been run yet."
+    smart_available: bool = False
+    smart_devices: list = field(default_factory=list)
+    smart_selected_device: str = ""
+    smart_match_confidence: str = "Unknown"
+    smart_match_reason: str = ""
+    smart_raw_output: str = ""
+    smart_parsed: dict = field(default_factory=dict)
+    windows_raw: object = None
+    windows_parsed: dict = field(default_factory=dict)
+    chkdsk_output: str = ""
+    surface_results: dict = field(default_factory=dict)
+    issues: list = field(default_factory=list)
+    report_txt: str = ""
+    report_json: str = ""
+    report_html: str = ""
+    report_pdf: str = ""
+
+
+@dataclass
+class DriveHealthSnapshot:
+    root: str = ""
+    drive_letter: str = ""
+    display_name: str = "Unknown Storage Device"
+    volume_label: str = "Unknown"
+    model: str = "Unknown"
+    manufacturer: str = "Unknown"
+    serial: str = "Unknown"
+    firmware: str = "Unknown"
+    capacity: int = 0
+    free: int = 0
+    used: int = 0
+    filesystem: str = "Unknown"
+    drive_type: str = "Unknown"
+    bus_type: str = "Unknown"
+    media_type: str = "Unknown"
+    smart_device: str = ""
+    smart_match_confidence: str = "Unknown"
+    smart_match_reason: str = ""
+    smart_status: str = "Unavailable"
+    windows_status: str = "Unknown"
+    temperature: str = "Unknown"
+    wear: str = "Unknown"
+    power_on_hours: str = "Unknown"
+    power_cycle_count: str = "Unknown"
+    reallocated: int = 0
+    pending: int = 0
+    uncorrectable: int = 0
+    crc_errors: int = 0
+    nvme_media_errors: int = 0
+    health_score: int = 0
+    health_status: str = "UNKNOWN"
+    recommendation: str = "Health data is incomplete for this device."
+    issues: list = field(default_factory=list)
+    raw_smart_preview: str = ""
+    smart_parsed: dict = field(default_factory=dict)
+    windows_parsed: dict = field(default_factory=dict)
+    last_checked: str = field(default_factory=now_stamp)
 
 
 @dataclass
@@ -463,6 +873,9 @@ class ScannerSettings:
     random_recheck_percent: int = 8
     auto_stop_severe_corruption: bool = False
     severe_corruption_blocks: int = 100
+    surface_scan_max_mb: int = 512
+    surface_scan_chunk_mb: int = 4
+    surface_scan_max_seconds: int = 180
 
 
 class Tooltip:
@@ -500,6 +913,1019 @@ class Tooltip:
         if self.tip:
             self.tip.destroy()
             self.tip = None
+
+
+class StorageHealthDiagnostics:
+    def __init__(self, target, log_callback=None, status_callback=None, progress_callback=None):
+        self.target = target
+        self.log = log_callback or (lambda message: None)
+        self.status = status_callback or (lambda message: None)
+        self.progress = progress_callback or (lambda value: None)
+        self.result = HealthDiagnosticResult(target=target)
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def disk_root(self):
+        try:
+            return get_disk_root(self.target)
+        except Exception:
+            return self.target or "/"
+
+    def add_issue(self, severity, title, detail, points):
+        self.result.issues.append({"severity": severity, "title": title, "detail": detail, "points": points})
+        self.result.health_risk_score = min(100, self.result.health_risk_score + points)
+        self.log(f"[Health/{severity}] {title}: {detail}")
+
+    def run_command_cancelable(self, cmd, timeout=180):
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            start = time.perf_counter()
+            while proc.poll() is None:
+                if self.cancelled:
+                    proc.terminate()
+                    try:
+                        out, err = proc.communicate(timeout=4)
+                    except Exception:
+                        proc.kill()
+                        out, err = proc.communicate()
+                    return 998, out or "", (err or "") + "\nCommand cancelled by user."
+                if time.perf_counter() - start > timeout:
+                    proc.terminate()
+                    try:
+                        out, err = proc.communicate(timeout=4)
+                    except Exception:
+                        proc.kill()
+                        out, err = proc.communicate()
+                    return 997, out or "", (err or "") + "\nCommand timed out."
+                time.sleep(0.2)
+            out, err = proc.communicate()
+            return proc.returncode, (out or "").strip(), (err or "").strip()
+        except Exception as exc:
+            return 999, "", str(exc)
+
+    def run_all(self, include_chkdsk=False, include_surface=False):
+        self.progress(5)
+        self.run_smart_check()
+        self.progress(40)
+        self.run_windows_health_check()
+        self.progress(70)
+        if include_chkdsk:
+            self.run_read_only_chkdsk()
+        if include_surface:
+            self.run_surface_read_stability_scan()
+        self.progress(100)
+        return self.finalize()
+
+    def run_smart_check(self):
+        self.status("Running SMART check...")
+        self.progress(10)
+        exe = smartctl_available()
+        if not exe:
+            self.result.smart_available = False
+            self.result.smart_status = "smartctl Missing"
+            self.add_issue("Info", "SMART unavailable", "smartctl was not found. Install smartmontools for SMART health analysis.", 0)
+            return self.result
+        self.result.smart_available = True
+        code, out, err = self.run_command_cancelable([exe, "--scan-open"], timeout=12)
+        if code != 0 or not out:
+            self.result.smart_status = "SMART Scan Failed"
+            self.add_issue("Medium", "SMART scan failed", err or out or "smartctl could not enumerate devices.", 8)
+            return self.result
+        target_meta, meta_warning = ({}, "")
+        if os.name == "nt":
+            try:
+                target_meta, meta_warning = get_disk_metadata_for_drive_cached(self.disk_root())
+            except Exception as exc:
+                meta_warning = str(exc)
+        if meta_warning:
+            self.log(f"[Health/Info] SMART target metadata note: {meta_warning}")
+        device_results = []
+        for line in out.splitlines():
+            if self.cancelled:
+                break
+            parts = line.split()
+            if not parts:
+                continue
+            dev = parts[0].strip()
+            code_a, out_a, err_a = self.run_command_cancelable([exe, "-a", dev], timeout=25)
+            if self.cancelled:
+                break
+            code_h, out_h, err_h = self.run_command_cancelable([exe, "-H", dev], timeout=15)
+            raw = f"===== {dev} smartctl -H =====\n{out_h or err_h}\n\n===== {dev} smartctl -a =====\n{out_a or err_a}"
+            parsed = self.parse_smart_output((out_h or "") + "\n" + (out_a or ""))
+            score, reason = self.score_smart_device_match(dev, parsed, raw, target_meta)
+            device_results.append({"device": dev, "raw": raw, "parsed": parsed, "score": score, "reason": reason})
+            self.progress(min(85, 20 + len(device_results) * 15))
+        self.result.smart_devices = [item["device"] for item in device_results]
+        selected = self.choose_smart_device(device_results)
+        if selected:
+            self.result.smart_selected_device = selected["device"]
+            self.result.smart_match_reason = selected["reason"]
+            self.result.smart_match_confidence = "High" if selected["score"] >= 80 else "Medium" if selected["score"] >= 35 else "Low"
+            self.result.smart_raw_output = selected["raw"][:120000]
+            self.merge_smart(selected["parsed"])
+            if selected["score"] < 35 and len(device_results) > 1:
+                self.add_issue(
+                    "Info",
+                    "SMART device match uncertain",
+                    "smartctl returned multiple devices and the selected drive could not be matched confidently. Parsed SMART data is best-effort.",
+                    0,
+                )
+        elif device_results:
+            self.result.smart_match_confidence = "Low"
+            self.result.smart_match_reason = "No confident mapping; preserving raw output from all devices."
+            self.result.smart_raw_output = "\n\n".join(item["raw"] for item in device_results)[:120000]
+            for item in device_results:
+                self.merge_smart(item["parsed"])
+        else:
+            self.result.smart_status = "No SMART Devices"
+            self.add_issue("Info", "No SMART devices returned", "smartctl did not return usable device entries.", 0)
+            return self.result
+        self.evaluate_smart_risk()
+        return self.result
+
+    def choose_smart_device(self, device_results):
+        if not device_results:
+            return None
+        ranked = sorted(device_results, key=lambda item: item.get("score", 0), reverse=True)
+        return ranked[0]
+
+    def score_smart_device_match(self, dev, parsed, raw, target_meta):
+        if not target_meta:
+            return 10, "No Windows target metadata available; using first/best smartctl device."
+        score = 0
+        reasons = []
+        raw_lower = raw.lower()
+        candidates = {
+            "serial": [
+                target_meta.get("SerialNumber"),
+                target_meta.get("PhysicalSerialNumber"),
+            ],
+            "model": [
+                target_meta.get("Model"),
+                target_meta.get("FriendlyName"),
+                target_meta.get("PhysicalFriendlyName"),
+            ],
+            "bus": [
+                target_meta.get("BusType"),
+                target_meta.get("PhysicalBusType"),
+            ],
+        }
+        for serial in candidates["serial"]:
+            serial_text = clean_identity_value(serial)
+            if serial_text and serial_text.lower().replace(" ", "") in raw_lower.replace(" ", ""):
+                score += 70
+                reasons.append(f"serial matched ({serial_text})")
+                break
+        for model in candidates["model"]:
+            model_text = clean_identity_value(model)
+            if model_text and model_text.lower() in raw_lower:
+                score += 30
+                reasons.append(f"model matched ({model_text})")
+                break
+            if model_text:
+                model_tokens = [t for t in model_text.lower().replace("-", " ").split() if len(t) >= 4]
+                token_hits = sum(1 for token in model_tokens if token in raw_lower)
+                if token_hits >= 2:
+                    score += 18
+                    reasons.append(f"model tokens matched ({token_hits})")
+                    break
+        for bus in candidates["bus"]:
+            bus_text = clean_identity_value(bus)
+            if bus_text and bus_text.lower() in raw_lower:
+                score += 8
+                reasons.append(f"bus matched ({bus_text})")
+                break
+        if os.name == "nt":
+            disk_number = clean_identity_value(target_meta.get("DiskNumber"))
+            if disk_number and (f"physicaldrive{disk_number}" in dev.lower() or f"pd{disk_number}" in dev.lower()):
+                score += 85
+                reasons.append(f"physical drive number matched ({disk_number})")
+        return min(100, score), "; ".join(reasons) or "No direct serial/model/bus match found."
+
+    def parse_smart_output(self, text):
+        parsed = {}
+        lower = text.lower()
+        if "smart overall-health self-assessment test result" in lower:
+            for line in text.splitlines():
+                if "overall-health" in line.lower() or "smart health status" in line.lower():
+                    parsed["overall_health"] = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+                    break
+        if "smart health status" in lower and "overall_health" not in parsed:
+            for line in text.splitlines():
+                if "smart health status" in line.lower():
+                    parsed["overall_health"] = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+                    break
+        attr_names = {
+            "Reallocated_Sector_Ct": "reallocated_sector_count",
+            "Reallocated_Event_Count": "reallocated_event_count",
+            "Current_Pending_Sector": "current_pending_sector_count",
+            "Offline_Uncorrectable": "offline_uncorrectable",
+            "UDMA_CRC_Error_Count": "udma_crc_error_count",
+            "Power_On_Hours": "power_on_hours",
+            "Power_Cycle_Count": "power_cycle_count",
+            "Temperature_Celsius": "temperature_celsius",
+            "Airflow_Temperature_Cel": "temperature_celsius",
+            "Percentage Used": "percentage_used",
+            "Media and Data Integrity Errors": "nvme_media_data_integrity_errors",
+            "Available Spare Threshold": "nvme_available_spare_threshold",
+            "Available Spare": "nvme_available_spare",
+            "Data Units Read": "nvme_data_units_read",
+            "Data Units Written": "nvme_data_units_written",
+            "Controller Busy Time": "nvme_controller_busy_time",
+            "Host Read Commands": "nvme_host_read_commands",
+            "Host Write Commands": "nvme_host_write_commands",
+            "Unsafe Shutdowns": "unsafe_shutdowns",
+            "Spin_Retry_Count": "spin_retry_count",
+            "Seek_Error_Rate": "seek_error_rate",
+            "Start_Stop_Count": "start_stop_count",
+            "Load_Cycle_Count": "load_cycle_count",
+            "Wear_Leveling_Count": "ssd_wear_leveling_count",
+            "Media_Wearout_Indicator": "ssd_media_wearout_indicator",
+            "Percent_Lifetime_Remain": "ssd_lifetime_remaining",
+        }
+        for line in text.splitlines():
+            stripped = line.strip()
+            lower_line = stripped.lower()
+            if lower_line.startswith(("device model:", "model number:", "product:")):
+                parsed.setdefault("model", stripped.split(":", 1)[-1].strip())
+            elif lower_line.startswith(("serial number:", "serial number")) and ":" in stripped:
+                parsed.setdefault("serial_number", stripped.split(":", 1)[-1].strip())
+            elif lower_line.startswith(("firmware version:", "firmware revision:")):
+                parsed.setdefault("firmware", stripped.split(":", 1)[-1].strip())
+            elif lower_line.startswith(("user capacity:", "total nvm capacity:", "namespace 1 size/capacity:")):
+                capacity_text = stripped.split(":", 1)[-1].split("bytes", 1)[0]
+                digits = "".join(ch for ch in capacity_text if ch.isdigit())
+                if digits:
+                    parsed.setdefault("user_capacity_bytes", safe_int(digits, 0))
+            for raw_name, key in attr_names.items():
+                if raw_name.lower() in stripped.lower():
+                    value = self.extract_last_number(stripped)
+                    if value is not None:
+                        parsed[key] = value
+                    break
+            if "temperature:" in stripped.lower() and "temperature_celsius" not in parsed:
+                value = self.extract_first_number(stripped)
+                if value is not None:
+                    parsed["temperature_celsius"] = value
+            if "percentage used:" in stripped.lower():
+                value = self.extract_first_number(stripped)
+                if value is not None:
+                    parsed["percentage_used"] = value
+        return parsed
+
+    def extract_last_number(self, text):
+        nums = []
+        current = ""
+        for ch in text:
+            if ch.isdigit():
+                current += ch
+            elif current:
+                nums.append(current)
+                current = ""
+        if current:
+            nums.append(current)
+        return int(nums[-1]) if nums else None
+
+    def extract_first_number(self, text):
+        nums = []
+        current = ""
+        for ch in text:
+            if ch.isdigit():
+                current += ch
+            elif current:
+                nums.append(current)
+                break
+        if current and not nums:
+            nums.append(current)
+        return int(nums[0]) if nums else None
+
+    def merge_smart(self, parsed):
+        for key, value in parsed.items():
+            old = self.result.smart_parsed.get(key)
+            if isinstance(value, int) and isinstance(old, int):
+                self.result.smart_parsed[key] = max(old, value)
+            elif key not in self.result.smart_parsed:
+                self.result.smart_parsed[key] = value
+
+    def evaluate_smart_risk(self):
+        data = self.result.smart_parsed
+        health = str(data.get("overall_health", "")).lower()
+        if health and not any(word in health for word in ("passed", "ok", "healthy")):
+            self.add_issue("High", "SMART health warning", f"SMART overall health is {data.get('overall_health')}.", 30)
+        reallocated = int(data.get("reallocated_sector_count", 0) or 0)
+        pending = int(data.get("current_pending_sector_count", 0) or 0)
+        uncorrectable = int(data.get("offline_uncorrectable", 0) or 0)
+        crc = int(data.get("udma_crc_error_count", 0) or 0)
+        temp = int(data.get("temperature_celsius", 0) or 0)
+        wear = int(data.get("percentage_used", 0) or 0)
+        media_errors = int(data.get("nvme_media_data_integrity_errors", 0) or 0)
+        if pending > 0:
+            self.add_issue("High", "Current pending sectors", f"{pending} pending sector(s) were reported.", 28)
+        if uncorrectable > 0:
+            self.add_issue("Critical", "Offline uncorrectable sectors", f"{uncorrectable} uncorrectable sector(s) were reported.", 40)
+        if reallocated >= 50:
+            self.add_issue("High", "High reallocated sector count", f"{reallocated} reallocated sector(s) were reported.", 24)
+        elif reallocated > 0:
+            self.add_issue("Medium", "Reallocated sectors present", f"{reallocated} reallocated sector(s) were reported.", 12)
+        if crc > 0:
+            self.add_issue("Warning", "UDMA CRC errors", f"{crc} CRC error(s) may indicate cable, port, bridge, or signal issues.", 6)
+        if temp >= 60:
+            self.add_issue("High", "High temperature", f"Temperature is {temp} C.", 18)
+        elif temp >= 50:
+            self.add_issue("Warning", "Elevated temperature", f"Temperature is {temp} C.", 8)
+        if wear >= 90:
+            self.add_issue("High", "SSD wear high", f"SMART percentage used is {wear}%.", 22)
+        elif wear >= 70:
+            self.add_issue("Warning", "SSD wear elevated", f"SMART percentage used is {wear}%.", 10)
+        if media_errors > 0:
+            self.add_issue("Critical", "NVMe media/data integrity errors", f"{media_errors} media/data integrity error(s) were reported.", 35)
+        self.result.temperature = f"{temp} C" if temp else self.result.temperature
+        self.result.wear_age = f"{wear}% used" if wear else self.result.wear_age
+        self.result.smart_status = data.get("overall_health", "SMART Parsed") if data else "SMART Output Collected"
+        if self.result.smart_selected_device:
+            self.result.smart_status = f"{self.result.smart_status} ({self.result.smart_match_confidence} match)"
+
+    def run_windows_health_check(self):
+        self.status("Running Windows health check...")
+        self.progress(10)
+        if os.name != "nt":
+            self.result.windows_health_status = "Non-Windows"
+            self.add_issue("Info", "Windows diagnostics unavailable", "Windows health analyzer is available only on Windows.", 0)
+            return self.result
+        drive_letter = self.disk_root()[0].upper() if self.disk_root() else ""
+        script = rf"""
+$ErrorActionPreference = 'SilentlyContinue'
+$drive = '{drive_letter}'
+$vol = Get-Volume -DriveLetter $drive
+$part = Get-Partition -DriveLetter $drive
+$disk = $part | Get-Disk
+$physical = Get-PhysicalDisk | Where-Object {{ $_.DeviceId -eq $disk.Number -or $_.FriendlyName -like "*$($disk.FriendlyName)*" }} | Select-Object -First 1
+$reliability = $null
+try {{ $reliability = Get-StorageReliabilityCounter -PhysicalDisk $physical }} catch {{ }}
+[PSCustomObject]@{{
+  Volume = $vol | Select-Object DriveLetter,FileSystemLabel,FileSystemType,HealthStatus,OperationalStatus,Size,SizeRemaining
+  Disk = $disk | Select-Object Number,FriendlyName,SerialNumber,HealthStatus,OperationalStatus,BusType,PartitionStyle,Size,IsBoot,IsSystem,IsReadOnly
+  PhysicalDisk = $physical | Select-Object FriendlyName,SerialNumber,MediaType,BusType,HealthStatus,OperationalStatus,Size
+  Reliability = $reliability | Select-Object Temperature,Wear,ReadErrorsTotal,WriteErrorsTotal,ReadErrorsCorrected,WriteErrorsCorrected,PowerOnHours,StartStopCycleCount
+}} | ConvertTo-Json -Depth 6 -Compress
+"""
+        data, err = run_powershell(script, timeout=25)
+        if err:
+            self.result.windows_health_status = "PowerShell Failed"
+            self.add_issue("Medium", "Windows health command failed", err, 8)
+            return self.result
+        self.result.windows_raw = data
+        self.result.windows_parsed = self.flatten_windows_health(data)
+        self.evaluate_windows_risk()
+        self.progress(100)
+        return self.result
+
+    def flatten_windows_health(self, data):
+        parsed = {}
+        if isinstance(data, dict):
+            for group, value in data.items():
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        parsed[f"{group}.{k}"] = v
+                else:
+                    parsed[group] = value
+        return parsed
+
+    def evaluate_windows_risk(self):
+        data = self.result.windows_parsed
+        status_text = " ".join(str(v) for k, v in data.items() if "HealthStatus" in k or "OperationalStatus" in k)
+        lower = status_text.lower()
+        if any(word in lower for word in ("unhealthy", "warning", "degraded", "lost communication", "predictive failure")):
+            self.add_issue("High", "Windows storage health warning", status_text.strip() or "Windows reported a health warning.", 28)
+        temp = safe_int(data.get("Reliability.Temperature"), 0)
+        wear = safe_int(data.get("Reliability.Wear"), 0)
+        read_errors = safe_int(data.get("Reliability.ReadErrorsTotal"), 0)
+        write_errors = safe_int(data.get("Reliability.WriteErrorsTotal"), 0)
+        if temp:
+            self.result.temperature = f"{temp} C"
+            if temp >= 60:
+                self.add_issue("High", "Windows high temperature", f"Storage reliability temperature is {temp} C.", 18)
+            elif temp >= 50:
+                self.add_issue("Warning", "Windows elevated temperature", f"Storage reliability temperature is {temp} C.", 8)
+        if wear:
+            self.result.wear_age = f"{wear}% wear"
+            if wear >= 90:
+                self.add_issue("High", "Windows wear high", f"Storage reliability wear is {wear}%.", 22)
+            elif wear >= 70:
+                self.add_issue("Warning", "Windows wear elevated", f"Storage reliability wear is {wear}%.", 10)
+        if read_errors:
+            self.add_issue("High", "Read errors reported by Windows", f"ReadErrorsTotal={read_errors}.", 20)
+        if write_errors:
+            self.add_issue("High", "Write errors reported by Windows", f"WriteErrorsTotal={write_errors}.", 20)
+        self.result.windows_health_status = status_text.strip() or "Windows Health Parsed"
+
+    def run_read_only_chkdsk(self):
+        self.status("Running read-only CHKDSK...")
+        self.progress(10)
+        if os.name != "nt":
+            self.result.chkdsk_output = "CHKDSK preview is available only on Windows."
+            return self.result
+        root = self.disk_root()
+        cmd = ["chkdsk", root]
+        self.log(f"Running safe read-only command: {' '.join(cmd)}")
+        code, out, err = self.run_command_cancelable(cmd, timeout=240)
+        text = (out or "") + ("\n" + err if err else "")
+        self.result.chkdsk_output = text[:160000] if text else f"CHKDSK returned code {code} with no output."
+        lower = self.result.chkdsk_output.lower()
+        if "windows has scanned the file system and found no problems" in lower or "no further action is required" in lower:
+            pass
+        elif any(word in lower for word in ("bad sectors", "corrupt", "errors found", "failed", "cannot continue")):
+            self.add_issue("Warning", "CHKDSK preview reported possible filesystem issues", "Read-only CHKDSK output contains warnings or error terms.", 10)
+        self.progress(100)
+        return self.result
+
+    def run_surface_read_stability_scan(self, max_bytes=512 * 1024 * 1024, chunk_size=4 * 1024 * 1024, max_seconds=180):
+        self.status("Running surface read stability scan...")
+        self.progress(5)
+        root = Path(self.target)
+        if not root.exists():
+            self.add_issue("High", "Surface scan target missing", "The selected target path does not exist.", 18)
+            return self.result
+        total = 0
+        samples = []
+        failures = []
+        slow = []
+        files_seen = 0
+        inaccessible = 0
+        started = time.perf_counter()
+        for path in self.iter_readable_files(root):
+            if self.cancelled or total >= max_bytes or (time.perf_counter() - started) >= max_seconds:
+                break
+            files_seen += 1
+            try:
+                with open(path, "rb", buffering=1024 * 1024) as fh:
+                    while total < max_bytes and not self.cancelled and (time.perf_counter() - started) < max_seconds:
+                        t0 = time.perf_counter()
+                        data = fh.read(chunk_size)
+                        elapsed = max(time.perf_counter() - t0, 0.0001)
+                        if not data:
+                            break
+                        total += len(data)
+                        mb_s = (len(data) / 1024 / 1024) / elapsed
+                        sample = {"file": str(path), "offset_sample_bytes": total, "bytes": len(data), "seconds": round(elapsed, 4), "mb_s": round(mb_s, 2)}
+                        samples.append(sample)
+                        self.progress(min(95, (total / max(1, max_bytes)) * 100))
+                        if elapsed > 3.0 or mb_s < 2.0:
+                            slow.append(sample)
+            except Exception as exc:
+                inaccessible += 1
+                failures.append({"file": str(path), "error": f"{type(exc).__name__}: {exc}"})
+                if len(failures) >= 20:
+                    break
+        elapsed_total = max(time.perf_counter() - started, 0.0001)
+        avg = (total / 1024 / 1024) / elapsed_total if total else 0
+        status = "Stable"
+        if failures:
+            status = "Read Error"
+            self.add_issue("High", "Read errors during surface scan", f"{len(failures)} file read error(s) occurred.", 24)
+        elif len(slow) >= 3:
+            status = "Slow / Weak Region"
+            self.add_issue("Warning", "Read stability slow regions", f"{len(slow)} slow read sample(s) were detected.", 12)
+        elif not samples:
+            status = "No readable sample"
+            self.add_issue(
+                "Info",
+                "No readable files sampled",
+                "The read stability scan is intentionally read-only and found no existing files to sample. Empty free space is not read through raw disk access.",
+                0,
+            )
+        self.result.read_stability_status = status
+        self.result.surface_results = {
+            "status": status,
+            "sampled_bytes": total,
+            "sampled_human": human_bytes(total),
+            "average_mb_s": round(avg, 2),
+            "files_seen": files_seen,
+            "inaccessible_files": inaccessible,
+            "slow_samples": slow[:50],
+            "read_failures": failures[:50],
+            "samples_preview": samples[:100],
+            "read_only_scope": "Existing readable files only; raw disk regions and unused free space are not read.",
+            "max_seconds": max_seconds,
+            "cancelled": self.cancelled,
+            "recommendation": "Needs Backup / Replacement Recommended" if status == "Read Error" else status,
+        }
+        self.progress(100)
+        return self.result
+
+    def iter_readable_files(self, root):
+        if root.is_file():
+            yield root
+            return
+        skip_parts = {TEST_DIR_NAME.lower(), "$recycle.bin", "system volume information"}
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in skip_parts]
+            for name in files:
+                path = Path(current) / name
+                try:
+                    if path.stat().st_size > 0:
+                        yield path
+                except Exception:
+                    continue
+
+    def finalize(self):
+        self.result.completed_at = now_stamp()
+        self.result.health_risk_score = min(100, max(0, self.result.health_risk_score))
+        if self.cancelled:
+            self.result.health_status = "Diagnostic Cancelled"
+            self.result.recommendation = "Diagnostic was cancelled before completion"
+            return self.result
+        score = self.result.health_risk_score
+        if score >= 75:
+            self.result.health_status = "Critical Health Risk"
+            self.result.recommendation = "Do not rely on this device for important data"
+        elif score >= 50:
+            self.result.health_status = "High Health Risk"
+            self.result.recommendation = "Replacement recommended"
+        elif score >= 25:
+            self.result.health_status = "Monitor"
+            self.result.recommendation = "Backup recommended"
+        elif score > 0:
+            self.result.health_status = "Minor Warnings"
+            self.result.recommendation = "Monitor this device"
+        else:
+            self.result.health_status = "No Major Health Issues Detected"
+            self.result.recommendation = "No major health issues detected"
+        return self.result
+
+    def to_dict(self):
+        return asdict(self.result)
+
+
+def smart_status_is_good(status):
+    text = str(status or "").lower()
+    return bool(text) and any(word in text for word in ("passed", "ok", "healthy", "normal", "good"))
+
+
+def health_status_color(status):
+    text = str(status or "").upper()
+    if "CRITICAL" in text:
+        return CYBER_RED
+    if "WARNING" in text:
+        return CYBER_ORANGE
+    if "HEALTHY" in text or "GOOD" in text:
+        return CYBER_GREEN
+    return CYBER_CYAN
+
+
+def _device_context_text(*values):
+    return " ".join(clean_identity_value(value) for value in values if clean_identity_value(value)).upper()
+
+
+def is_nvme_drive(bus_type="", media_type="", model="", raw=""):
+    return "NVME" in _device_context_text(bus_type, media_type, model, raw)
+
+
+def is_hdd_drive(bus_type="", media_type="", model="", raw="", drive_type=""):
+    text = _device_context_text(bus_type, media_type, model, raw, drive_type)
+    return any(token in text for token in ("HDD", "HARD DISK", "HARD DRIVE", "ROTATIONAL", "SPIN"))
+
+
+def is_ssd_drive(bus_type="", media_type="", model="", raw=""):
+    text = _device_context_text(bus_type, media_type, model, raw)
+    return "NVME" in text or "SSD" in text or "SOLID" in text
+
+
+def is_usb_bridge_device(bus_type="", media_type="", model="", raw="", drive_type="", smart_status=""):
+    text = _device_context_text(bus_type, media_type, model, raw, drive_type, smart_status)
+    return "USB" in text or "REMOVABLE" in text or "BRIDGE" in text
+
+
+def supports_wear_metrics(bus_type="", media_type="", model="", raw=""):
+    return is_ssd_drive(bus_type, media_type, model, raw)
+
+
+def supports_temperature_metrics(bus_type="", media_type="", model="", raw="", drive_type="", smart_status=""):
+    if is_usb_bridge_device(bus_type, media_type, model, raw, drive_type, smart_status) and "UNAVAILABLE" in str(smart_status or "").upper():
+        return False
+    return True
+
+
+def effective_wear_value(smart_parsed=None, windows_parsed=None):
+    smart_parsed = smart_parsed or {}
+    windows_parsed = windows_parsed or {}
+    for key in ("percentage_used", "ssd_wear_leveling_count"):
+        value = safe_int(smart_parsed.get(key), 0)
+        if value:
+            return value, "% used" if key == "percentage_used" else "wear level"
+    value = safe_int(windows_parsed.get("Reliability.Wear"), 0)
+    if value:
+        return value, "% wear"
+    remaining = safe_int(smart_parsed.get("ssd_lifetime_remaining"), 0)
+    if remaining:
+        return remaining, "life remaining"
+    media_wearout = safe_int(smart_parsed.get("ssd_media_wearout_indicator"), 0)
+    if media_wearout:
+        return media_wearout, "life remaining"
+    return 0, ""
+
+
+def format_wear_metric(smart_parsed=None, windows_parsed=None, bus_type="", media_type="", model="", raw="", drive_type="", smart_status=""):
+    smart_parsed = smart_parsed or {}
+    windows_parsed = windows_parsed or {}
+    value, kind = effective_wear_value(smart_parsed, windows_parsed)
+    if value:
+        if kind == "life remaining":
+            return f"Life Remaining: {value}%"
+        if kind == "wear level":
+            return f"Wear Level: {value}"
+        return f"{value}{kind}"
+    if is_hdd_drive(bus_type, media_type, model, raw, drive_type):
+        return "N/A (Mechanical HDD)"
+    if is_usb_bridge_device(bus_type, media_type, model, raw, drive_type, smart_status) and not supports_wear_metrics(bus_type, media_type, model, raw):
+        return "Not Exposed"
+    if supports_wear_metrics(bus_type, media_type, model, raw):
+        return "Not Reported"
+    return "Unsupported"
+
+
+def format_temperature_metric(smart_parsed=None, windows_parsed=None, bus_type="", media_type="", model="", raw="", drive_type="", smart_status=""):
+    smart_parsed = smart_parsed or {}
+    windows_parsed = windows_parsed or {}
+    temp = safe_int(smart_parsed.get("temperature_celsius") or windows_parsed.get("Reliability.Temperature"), 0)
+    if temp:
+        return f"{temp} C"
+    if is_usb_bridge_device(bus_type, media_type, model, raw, drive_type, smart_status):
+        return "USB Bridge Hidden"
+    if supports_temperature_metrics(bus_type, media_type, model, raw, drive_type, smart_status):
+        return "Not Exposed"
+    return "Unavailable"
+
+
+def normalize_health_recommendation(base, health_status, smart_status, bus_type="", media_type="", model="", raw="", drive_type="", issues=None):
+    if str(health_status or "").upper() in ("CRITICAL", "WARNING") or issues:
+        if any(i.get("points", 0) > 0 for i in (issues or [])):
+            return base
+    if is_hdd_drive(bus_type, media_type, model, raw, drive_type):
+        return "Mechanical HDD operating normally" if smart_status_is_good(smart_status) or base == "No major health issues detected" else base
+    if is_ssd_drive(bus_type, media_type, model, raw):
+        return "SSD wear remains within normal range" if base == "No major health issues detected" else base
+    if is_usb_bridge_device(bus_type, media_type, model, raw, drive_type, smart_status) and "unavailable" in str(smart_status or "").lower():
+        return "SMART data partially unavailable"
+    return base
+
+
+def collect_smartctl_device_results(log_callback=None, timeout_per_device=28):
+    log = log_callback or (lambda _message: None)
+    exe = smartctl_available()
+    if not exe:
+        return [], "smartctl not found. Install smartmontools for SMART health analysis."
+    code, out, err = run_command([exe, "--scan-open"], timeout=14)
+    if code != 0 or not out:
+        return [], err or out or "smartctl could not enumerate storage devices."
+    parser = StorageHealthDiagnostics("")
+    devices = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        dev = parts[0].strip()
+        if not dev:
+            continue
+        code_h, out_h, err_h = run_command([exe, "-H", dev], timeout=18)
+        code_a, out_a, err_a = run_command([exe, "-a", dev], timeout=timeout_per_device)
+        raw = f"===== {dev} smartctl -H =====\n{out_h or err_h}\n\n===== {dev} smartctl -a =====\n{out_a or err_a}"
+        parsed = parser.parse_smart_output((out_h or "") + "\n" + (out_a or ""))
+        devices.append(
+            {
+                "device": dev,
+                "scan_line": line,
+                "raw": raw,
+                "parsed": parsed,
+                "returncode_health": code_h,
+                "returncode_all": code_a,
+            }
+        )
+        log(f"SMART dashboard collected read-only data for {dev}.")
+    return devices, ""
+
+
+def collect_windows_health_for_root(root):
+    if os.name != "nt":
+        return {}, "Windows health metadata is unavailable on this platform."
+    drive_letter = (root or "")[0].upper()
+    if not drive_letter:
+        return {}, "No drive letter available for Windows health metadata."
+    script = rf"""
+$ErrorActionPreference = 'SilentlyContinue'
+$drive = '{drive_letter}'
+$vol = Get-Volume -DriveLetter $drive
+$part = Get-Partition -DriveLetter $drive
+$disk = $part | Get-Disk
+$physical = Get-PhysicalDisk | Where-Object {{ $_.DeviceId -eq $disk.Number -or $_.FriendlyName -like "*$($disk.FriendlyName)*" }} | Select-Object -First 1
+$reliability = $null
+try {{ $reliability = Get-StorageReliabilityCounter -PhysicalDisk $physical }} catch {{ }}
+[PSCustomObject]@{{
+  Volume = $vol | Select-Object DriveLetter,FileSystemLabel,FileSystemType,HealthStatus,OperationalStatus,Size,SizeRemaining
+  Disk = $disk | Select-Object Number,FriendlyName,SerialNumber,Manufacturer,Model,FirmwareVersion,HealthStatus,OperationalStatus,BusType,PartitionStyle,Size,IsBoot,IsSystem,IsReadOnly
+  PhysicalDisk = $physical | Select-Object DeviceId,FriendlyName,SerialNumber,FirmwareVersion,MediaType,BusType,HealthStatus,OperationalStatus,Size
+  Reliability = $reliability | Select-Object Temperature,Wear,ReadErrorsTotal,WriteErrorsTotal,ReadErrorsCorrected,WriteErrorsCorrected,PowerOnHours,StartStopCycleCount
+}} | ConvertTo-Json -Depth 6 -Compress
+"""
+    data, err = run_powershell(script, timeout=24)
+    if err:
+        return {}, err
+    return StorageHealthDiagnostics(root).flatten_windows_health(data), ""
+
+
+def drive_health_risk_from_values(smart_parsed=None, windows_parsed=None, smart_status="", windows_status=""):
+    smart_parsed = smart_parsed or {}
+    windows_parsed = windows_parsed or {}
+    risk = 0
+    issues = []
+
+    def add(severity, title, detail, points):
+        nonlocal risk
+        issues.append({"severity": severity, "title": title, "detail": detail, "points": points})
+        risk = min(100, risk + points)
+
+    health_text = str(smart_status or smart_parsed.get("overall_health", "")).lower()
+    if health_text and not smart_status_is_good(health_text) and "unavailable" not in health_text and "missing" not in health_text:
+        add("Critical", "SMART overall health warning", f"SMART reports: {smart_status or smart_parsed.get('overall_health')}", 45)
+    pending = safe_int(smart_parsed.get("current_pending_sector_count"), 0)
+    uncorrectable = safe_int(smart_parsed.get("offline_uncorrectable"), 0)
+    reallocated = safe_int(smart_parsed.get("reallocated_sector_count"), 0)
+    crc = safe_int(smart_parsed.get("udma_crc_error_count"), 0)
+    temp = safe_int(smart_parsed.get("temperature_celsius") or windows_parsed.get("Reliability.Temperature"), 0)
+    wear, wear_kind = effective_wear_value(smart_parsed, windows_parsed)
+    nvme_errors = safe_int(smart_parsed.get("nvme_media_data_integrity_errors"), 0)
+    read_errors = safe_int(windows_parsed.get("Reliability.ReadErrorsTotal"), 0)
+    write_errors = safe_int(windows_parsed.get("Reliability.WriteErrorsTotal"), 0)
+    windows_text = " ".join(
+        str(value)
+        for key, value in windows_parsed.items()
+        if "HealthStatus" in key or "OperationalStatus" in key
+    ) or str(windows_status or "")
+    lower_windows = windows_text.lower()
+
+    if pending > 0:
+        add("High", "Current pending sectors", f"{pending} pending sector(s) reported.", 28)
+    if uncorrectable > 0:
+        add("Critical", "Offline uncorrectable sectors", f"{uncorrectable} uncorrectable sector(s) reported.", 40)
+    if reallocated >= 50:
+        add("High", "High reallocated sector count", f"{reallocated} reallocated sector(s) reported.", 24)
+    elif reallocated > 0:
+        add("Warning", "Reallocated sectors present", f"{reallocated} reallocated sector(s) reported.", 12)
+    if crc > 0:
+        add("Warning", "CRC errors reported", f"{crc} CRC error(s) may indicate cable, bridge, or signal issues.", 6)
+    if temp >= 60:
+        add("High", "High temperature", f"Temperature is {temp} C.", 18)
+    elif temp >= 50:
+        add("Warning", "Elevated temperature", f"Temperature is {temp} C.", 8)
+    if wear_kind in ("% used", "% wear"):
+        if wear >= 90:
+            add("High", "SSD wear high", f"SSD wear metric is {wear} ({wear_kind}).", 22)
+        elif wear >= 70:
+            add("Warning", "SSD wear elevated", f"SSD wear metric is {wear} ({wear_kind}).", 10)
+    elif wear_kind == "life remaining":
+        if wear <= 10:
+            add("High", "SSD life remaining low", f"SSD life remaining is {wear}%.", 22)
+        elif wear <= 30:
+            add("Warning", "SSD life remaining reduced", f"SSD life remaining is {wear}%.", 10)
+    if nvme_errors > 0:
+        add("Critical", "NVMe media/data integrity errors", f"{nvme_errors} media/data integrity error(s) reported.", 35)
+    if read_errors:
+        add("High", "Windows read errors", f"ReadErrorsTotal={read_errors}.", 20)
+    if write_errors:
+        add("High", "Windows write errors", f"WriteErrorsTotal={write_errors}.", 20)
+    if any(word in lower_windows for word in ("unhealthy", "warning", "degraded", "lost communication", "predictive failure", "failed")):
+        add("High", "Windows storage health warning", windows_text.strip() or "Windows reported a health warning.", 28)
+
+    health_score = max(0, 100 - risk)
+    has_health_data = bool(smart_parsed or windows_parsed or smart_status or windows_status)
+    if not has_health_data:
+        status = "UNKNOWN"
+        recommendation = "Health data is incomplete for this device."
+    elif risk >= 75:
+        status = "CRITICAL"
+        recommendation = "Do not rely on this device for important data"
+    elif risk >= 50:
+        status = "CRITICAL"
+        recommendation = "Replacement recommended"
+    elif risk >= 25:
+        status = "WARNING"
+        recommendation = "Backup recommended"
+    elif risk > 0:
+        status = "WARNING"
+        recommendation = "Monitor this device"
+    else:
+        status = "GOOD"
+        recommendation = "No major health issues detected"
+    return health_score, status, recommendation, issues
+
+
+def build_drive_health_snapshot(root, smart_results=None, smart_warning=""):
+    smart_results = smart_results or []
+    volume_info = {}
+    metadata = {}
+    usage = None
+    drive_type = "Unknown"
+    windows_parsed = {}
+    warnings = []
+    try:
+        drive_type = get_drive_type(root)
+    except Exception as exc:
+        warnings.append(str(exc))
+    try:
+        volume_info = get_volume_info(root)
+    except Exception as exc:
+        warnings.append(str(exc))
+    try:
+        usage = shutil.disk_usage(root)
+    except Exception as exc:
+        warnings.append(str(exc))
+    try:
+        metadata, meta_warning = get_disk_metadata_for_drive_cached(root)
+        if meta_warning:
+            warnings.append(meta_warning)
+    except Exception as exc:
+        metadata = {}
+        warnings.append(str(exc))
+    try:
+        windows_parsed, windows_warning = collect_windows_health_for_root(root)
+        if windows_warning:
+            warnings.append(windows_warning)
+    except Exception as exc:
+        windows_parsed = {}
+        warnings.append(str(exc))
+
+    parser = StorageHealthDiagnostics(root)
+    ranked = []
+    for item in smart_results:
+        parsed = item.get("parsed", {})
+        raw = item.get("raw", "")
+        score, reason = parser.score_smart_device_match(item.get("device", ""), parsed, raw, metadata)
+        smart_capacity = safe_int(parsed.get("user_capacity_bytes"), 0)
+        actual_capacity = getattr(usage, "total", 0) if usage else 0
+        if smart_capacity and actual_capacity:
+            diff_ratio = abs(smart_capacity - actual_capacity) / max(smart_capacity, actual_capacity)
+            if diff_ratio <= 0.05:
+                score = min(100, score + 10)
+                reason = f"{reason}; capacity similar" if reason else "capacity similar"
+        ranked.append((score, reason, item))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    best_score, best_reason, best = ranked[0] if ranked else (0, "", None)
+    smart_parsed = dict(best.get("parsed", {})) if best else {}
+    smart_raw = best.get("raw", "") if best else ""
+    smart_device = best.get("device", "") if best else ""
+    confidence = "High" if best_score >= 80 else "Medium" if best_score >= 35 else "Low" if best else "Unavailable"
+    smart_status = smart_parsed.get("overall_health", "")
+    if not smart_status:
+        if smart_warning:
+            smart_status = "Unavailable"
+            warnings.append(smart_warning)
+        elif smart_results:
+            smart_status = "SMART output collected"
+        else:
+            smart_status = "Unavailable"
+    if best and best_score < 35:
+        warnings.append("SMART Match: Low confidence. Windows health data is still shown.")
+
+    manufacturer = clean_identity_value(metadata.get("Manufacturer")) or "Unknown"
+    model = (
+        clean_identity_value(metadata.get("PhysicalFriendlyName"))
+        or clean_identity_value(metadata.get("FriendlyName"))
+        or clean_identity_value(metadata.get("Model"))
+        or clean_identity_value(smart_parsed.get("model"))
+        or "Unknown"
+    )
+    serial = (
+        clean_identity_value(metadata.get("PhysicalSerialNumber"))
+        or clean_identity_value(metadata.get("SerialNumber"))
+        or clean_identity_value(smart_parsed.get("serial_number"))
+        or "Unknown"
+    )
+    firmware = (
+        clean_identity_value(metadata.get("FirmwareVersion"))
+        or clean_identity_value(metadata.get("PhysicalFirmwareVersion"))
+        or clean_identity_value(smart_parsed.get("firmware"))
+        or clean_identity_value(windows_parsed.get("Disk.FirmwareVersion"))
+        or clean_identity_value(windows_parsed.get("PhysicalDisk.FirmwareVersion"))
+        or "Unknown"
+    )
+    bus_type = (
+        clean_identity_value(metadata.get("BusType"))
+        or clean_identity_value(metadata.get("PhysicalBusType"))
+        or clean_identity_value(windows_parsed.get("Disk.BusType"))
+        or clean_identity_value(windows_parsed.get("PhysicalDisk.BusType"))
+        or "Unknown"
+    )
+    media_type = (
+        clean_identity_value(metadata.get("PhysicalMediaType"))
+        or clean_identity_value(windows_parsed.get("PhysicalDisk.MediaType"))
+        or classify_drive_badge(drive_type, metadata)
+        or "Unknown"
+    )
+    windows_status = (
+        clean_identity_value(metadata.get("HealthStatus"))
+        or clean_identity_value(metadata.get("PhysicalHealthStatus"))
+        or clean_identity_value(windows_parsed.get("Disk.HealthStatus"))
+        or clean_identity_value(windows_parsed.get("PhysicalDisk.HealthStatus"))
+        or "Unknown"
+    )
+    display_name = build_drive_display_name(root, metadata, volume_info, usage, drive_type)
+    health_score, health_status, recommendation, issues = drive_health_risk_from_values(
+        smart_parsed=smart_parsed,
+        windows_parsed=windows_parsed,
+        smart_status=smart_status,
+        windows_status=windows_status,
+    )
+    for warning in warnings:
+        if warning:
+            issues.append({"severity": "Info", "title": "Collection note", "detail": str(warning), "points": 0})
+    temperature_text = format_temperature_metric(smart_parsed, windows_parsed, bus_type, media_type, model, smart_raw, drive_type, smart_status)
+    wear_text = format_wear_metric(smart_parsed, windows_parsed, bus_type, media_type, model, smart_raw, drive_type, smart_status)
+    recommendation = normalize_health_recommendation(
+        recommendation,
+        health_status,
+        smart_status,
+        bus_type=bus_type,
+        media_type=media_type,
+        model=model,
+        raw=smart_raw,
+        drive_type=drive_type,
+        issues=issues,
+    )
+
+    return DriveHealthSnapshot(
+        root=root,
+        drive_letter=root[:2].upper() if os.name == "nt" and root else root,
+        display_name=display_name,
+        volume_label=volume_info.get("volume_name", "Unknown") or "Unknown",
+        model=model,
+        manufacturer=manufacturer,
+        serial=serial,
+        firmware=firmware,
+        capacity=getattr(usage, "total", 0) if usage else 0,
+        free=getattr(usage, "free", 0) if usage else 0,
+        used=getattr(usage, "used", 0) if usage else 0,
+        filesystem=volume_info.get("filesystem", "Unknown") or "Unknown",
+        drive_type=drive_type,
+        bus_type=bus_type,
+        media_type=media_type,
+        smart_device=smart_device,
+        smart_match_confidence=confidence,
+        smart_match_reason=best_reason or ("No smartctl match available." if not best else "No direct match details."),
+        smart_status=smart_status,
+        windows_status=windows_status,
+        temperature=temperature_text,
+        wear=wear_text,
+        power_on_hours=str(safe_int(smart_parsed.get("power_on_hours") or windows_parsed.get("Reliability.PowerOnHours"), 0) or "Not Reported"),
+        power_cycle_count=str(safe_int(smart_parsed.get("power_cycle_count") or windows_parsed.get("Reliability.StartStopCycleCount"), 0) or "Not Reported"),
+        reallocated=safe_int(smart_parsed.get("reallocated_sector_count"), 0),
+        pending=safe_int(smart_parsed.get("current_pending_sector_count"), 0),
+        uncorrectable=safe_int(smart_parsed.get("offline_uncorrectable"), 0),
+        crc_errors=safe_int(smart_parsed.get("udma_crc_error_count"), 0),
+        nvme_media_errors=safe_int(smart_parsed.get("nvme_media_data_integrity_errors"), 0),
+        health_score=health_score,
+        health_status=health_status,
+        recommendation=recommendation,
+        issues=issues,
+        raw_smart_preview=smart_raw[:16000] if smart_raw else ("SMART unavailable through USB bridge or smartctl not installed." if smart_warning else ""),
+        smart_parsed=smart_parsed,
+        windows_parsed=windows_parsed,
+        last_checked=now_stamp(),
+    )
+
+
+def collect_all_drive_health_snapshots(log_callback=None, roots=None):
+    log = log_callback or (lambda _message: None)
+    roots = roots or get_windows_drives() or (["/"] if os.name != "nt" else [])
+    smart_results, smart_warning = collect_smartctl_device_results(log_callback=log)
+    snapshots = []
+    for root in roots:
+        try:
+            snapshots.append(build_drive_health_snapshot(root, smart_results, smart_warning))
+        except Exception as exc:
+            logging.exception("Failed to build drive health snapshot for %s", root)
+            snapshots.append(
+                DriveHealthSnapshot(
+                    root=root,
+                    drive_letter=root[:2].upper() if os.name == "nt" and root else root,
+                    display_name=f"({root[:2].upper()}) Unknown Storage Device" if os.name == "nt" and root else "Unknown Storage Device",
+                    health_status="UNKNOWN",
+                    health_score=0,
+                    recommendation="Health data could not be collected for this device.",
+                    issues=[{"severity": "Info", "title": "Collection failed", "detail": f"{type(exc).__name__}: {exc}", "points": 0}],
+                    last_checked=now_stamp(),
+                )
+            )
+    return snapshots
 
 
 class StorageScanner:
@@ -682,7 +2108,7 @@ class StorageScanner:
 
             if self.settings.enable_powershell_metadata:
                 self.log("Collecting filesystem and physical disk metadata...")
-                meta, warning = get_disk_metadata_for_drive(disk_root)
+                meta, warning = get_disk_metadata_for_drive_cached(disk_root)
                 result.disk_metadata = meta
                 result.metadata_warning = warning or ""
                 if warning:
@@ -1328,6 +2754,7 @@ class StorageScanner:
         if result.scan_interrupted and not result.status.startswith("SCAN INTERRUPTED"):
             result.status = f"SCAN INTERRUPTED - PARTIAL RESULTS ({result.status})"
         result.conclusion = self.make_conclusion(result)
+        result.health_diagnostics = dict(LAST_HEALTH_SUMMARY) if isinstance(LAST_HEALTH_SUMMARY, dict) else {}
         try:
             self.generate_reports(result)
             append_history(
@@ -1376,7 +2803,7 @@ class StorageScanner:
         reports_dir = ensure_reports_dir()
         clean_root = result.root.replace("\\", "_").replace("/", "_").replace(":", "")
         base = reports_dir / f"storage_report_{clean_root}_{file_stamp()}"
-        enabled = set(self.settings.report_formats or REPORT_FORMATS)
+        enabled = set(REPORT_FORMATS if self.settings.report_formats is None else self.settings.report_formats)
         if "CSV" in enabled:
             result.csv_report_path = str(base.with_suffix(".csv"))
         if "JSON" in enabled:
@@ -1573,6 +3000,7 @@ class StorageScanner:
                 lines.append(f"  {issue.detail}")
         else:
             lines.append("No major suspicious findings were detected during this scan.")
+        lines += self.health_report_lines(result.health_diagnostics)
         lines += [
             "",
             "LIMITATIONS",
@@ -1582,6 +3010,44 @@ class StorageScanner:
             "=" * 78,
         ]
         return "\n".join(lines)
+
+    def health_report_lines(self, health):
+        lines = ["", "STORAGE HEALTH & DIAGNOSTICS", "-" * 78]
+        if not health:
+            lines.append("No Storage Health & Diagnostics run has been attached to this report.")
+            return lines
+        lines.extend(
+            [
+                f"Health Status: {health.get('health_status', 'Unknown')}",
+                f"Health Risk Score: {health.get('health_risk_score', 0)}/100",
+                f"Recommendation: {health.get('recommendation', 'N/A')}",
+                f"SMART Status: {health.get('smart_status', 'N/A')}",
+                f"Windows Health Status: {health.get('windows_health_status', 'N/A')}",
+                f"Temperature: {health.get('temperature', 'Unknown')}",
+                f"Wear / Age: {health.get('wear_age', 'Unknown')}",
+                f"Read Stability: {health.get('read_stability_status', 'N/A')}",
+                "",
+                "SMART Parsed Results:",
+                json.dumps(health.get("smart_parsed", {}), indent=2),
+                "",
+                "Windows Health Results:",
+                json.dumps(health.get("windows_parsed", {}), indent=2),
+                "",
+                "Surface Read Stability Results:",
+                json.dumps(health.get("surface_results", {}), indent=2),
+                "",
+                "Read-only CHKDSK Output:",
+                str(health.get("chkdsk_output", "Not run"))[:12000],
+            ]
+        )
+        issues = health.get("issues") or []
+        lines += ["", "Health Findings:"]
+        if issues:
+            for item in issues:
+                lines.append(f"[{item.get('severity')}] {item.get('title')}: {item.get('detail')}")
+        else:
+            lines.append("No health-specific findings recorded.")
+        return lines
 
     def report_log_preview(self, max_lines=60):
         log_path = ensure_reports_dir() / LOG_FILE_NAME
@@ -1605,6 +3071,35 @@ class StorageScanner:
             "</tr>"
             for item in ranges
         )
+
+    def html_health_section(self, health):
+        if not health:
+            return "<div class=\"panel\" style=\"margin-top:8px\"><h2>Storage Health & Diagnostics</h2><p>No health diagnostics run has been attached to this report.</p></div>"
+        issues = health.get("issues") or []
+        issue_rows = "".join(
+            f"<tr><td>{html.escape(str(i.get('severity', '')))}</td><td>{html.escape(str(i.get('title', '')))}</td><td>{html.escape(str(i.get('detail', '')))}</td></tr>"
+            for i in issues
+        ) or "<tr><td colspan=\"3\">No health-specific findings recorded.</td></tr>"
+        parsed = html.escape(json.dumps(health.get("smart_parsed", {}), indent=2))
+        windows = html.escape(json.dumps(health.get("windows_parsed", {}), indent=2))
+        surface = html.escape(json.dumps(health.get("surface_results", {}), indent=2))
+        chkdsk = html.escape(str(health.get("chkdsk_output", "Not run"))[:14000])
+        return f"""
+<div class="panel" style="margin-top:8px"><h2>Storage Health & Diagnostics</h2>
+<div class="grid metrics">
+<div class="metric"><small>Health Status</small><b>{html.escape(str(health.get('health_status', 'Unknown')))}</b></div>
+<div class="metric"><small>SMART Status</small><b>{html.escape(str(health.get('smart_status', 'Unknown')))}</b></div>
+<div class="metric"><small>Windows Health</small><b>{html.escape(str(health.get('windows_health_status', 'Unknown')))}</b></div>
+<div class="metric"><small>Temperature</small><b>{html.escape(str(health.get('temperature', 'Unknown')))}</b></div>
+<div class="metric"><small>Health Risk</small><b>{html.escape(str(health.get('health_risk_score', 0)))} / 100</b></div>
+</div>
+<p><b>Recommendation:</b> {html.escape(str(health.get('recommendation', 'N/A')))}</p>
+<h3>Health Findings</h3><table><tr><th>Severity</th><th>Finding</th><th>Detail</th></tr>{issue_rows}</table>
+<h3>SMART Parsed Results</h3><pre>{parsed}</pre>
+<h3>Windows Health Results</h3><pre>{windows}</pre>
+<h3>Surface Read Stability Results</h3><pre>{surface}</pre>
+<h3>Read-only CHKDSK Output</h3><pre>{chkdsk}</pre>
+</div>"""
 
     def html_report(self, result: ScanResult, for_pdf=False) -> str:
         verified_ranges_raw = self.block_ranges(lambda b: b.verification_result == "ok")
@@ -1761,6 +3256,7 @@ ul {{ margin:0; padding-left:18px; }} li {{ margin:7px 0; }} li span {{ display:
 <p>Device metadata:</p><pre>{html.escape(json.dumps(result.disk_metadata or {}, indent=2))}</pre></div>
 </div>
 <div class="panel" style="margin-top:8px"><h2>Block Report Preview</h2><table><tr><th>#</th><th>Offset</th><th>Size</th><th>Write</th><th>Verify</th><th>Write MB/s</th><th>Read MB/s</th><th>Error</th></tr>{block_rows}</table></div>
+{self.html_health_section(result.health_diagnostics)}
 <div class="warning" style="margin-top:8px"><h2>FINAL WARNING</h2><p>{html.escape(result.conclusion or 'N/A')}</p><strong>{html.escape(warning_text)}</strong></div>
 <div class="footer-note">Generated by {APP_NAME} v{APP_VERSION}. TXT, JSON, CSV, HTML, and optional PDF reports preserve the same scan evidence without modifying scan logic.</div>
 </div></div></body></html>"""
@@ -1776,19 +3272,57 @@ class CyberStorageVerifierApp(tk.Tk):
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         self.metric_queue = queue.Queue()
+        self.health_queue = queue.Queue()
         self.scan_thread = None
+        self.health_thread = None
+        self.drive_health_thread = None
         self.scanner = None
+        self.health_runner = None
+        self.last_health_result = None
+        self.drive_health_snapshots = []
+        self.selected_drive_health_root = ""
+        self.drive_health_loading = False
+        self.drive_health_card_widgets = {}
+        self.drive_detail_windows = {}
+        self.drive_display_map = {}
+        self.drive_identity_map = {}
+        self.drive_refresh_queue = queue.Queue()
+        self.drive_refresh_thread = None
+        self.drive_refresh_generation = 0
         self.last_result = None
         self.settings = ScannerSettings()
         self.resume_session_path = None
         self.setup_logging()
+        self.runtime_info = check_packaged_runtime()
+        self.apply_app_icon()
+        self.load_app_settings()
         self.setup_style()
         self.create_ui()
         self.refresh_drives()
         self.refresh_sessions()
         self.refresh_history()
+        self.after(450, self.refresh_all_drive_health)
         self.after(100, self.process_queues)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def load_app_settings(self):
+        try:
+            settings_path = ensure_reports_dir() / "app_settings.json"
+            if settings_path.exists():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if hasattr(self.settings, key):
+                            setattr(self.settings, key, value)
+        except Exception:
+            logging.exception("Failed to load app settings")
+
+    def save_app_settings(self):
+        try:
+            settings_path = ensure_reports_dir() / "app_settings.json"
+            settings_path.write_text(json.dumps(asdict(self.settings), indent=2), encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to save app settings")
 
     def setup_logging(self):
         reports_dir = ensure_reports_dir()
@@ -1812,6 +3346,17 @@ class CyberStorageVerifierApp(tk.Tk):
                 force=True,
             )
             logging.warning("Primary log path unavailable; using %s", fallback_path)
+
+    def apply_app_icon(self):
+        try:
+            icon_path = Path(APP_ICON_PATH)
+            if icon_path.is_file():
+                self.iconbitmap(str(icon_path))
+                logging.info("Application icon loaded from %s", icon_path)
+            else:
+                logging.info("Application icon not found at %s", icon_path)
+        except Exception as exc:
+            logging.info("Application icon could not be applied: %s", exc)
 
     def setup_style(self):
         self.style = ttk.Style()
@@ -1941,7 +3486,7 @@ class CyberStorageVerifierApp(tk.Tk):
         self.notebook = ttk.Notebook(self, style="Cyber.TNotebook")
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self.tabs = {}
-        for name in ("Dashboard", "Scan Controls", "Active Scan", "Device Metadata", "Findings", "Reports", "Scan History", "Settings", "Help Center"):
+        for name in ("Dashboard", "Scan Controls", "Active Scan", "Device Metadata", "Findings", "Reports", "Scan History", "Health History", "Settings", "Storage Health & Diagnostics", "Help Center"):
             frame = tk.Frame(self.notebook, bg=CYBER_BG)
             self.tabs[name] = frame
             self.notebook.add(frame, text=name)
@@ -1952,7 +3497,9 @@ class CyberStorageVerifierApp(tk.Tk):
         self.create_findings_tab()
         self.create_reports_tab()
         self.create_history_tab()
+        self.create_health_history_tab()
         self.create_settings_tab()
+        self.create_health_diagnostics_tab()
         self.create_help_tab()
         self.bind_keyboard_shortcuts()
 
@@ -2117,7 +3664,28 @@ class CyberStorageVerifierApp(tk.Tk):
         self.drive_var = tk.StringVar()
         self.drive_combo = self.cyber_combo(panel, variable=self.drive_var)
         self.drive_combo.grid(row=r, column=1, sticky="ew", padx=8, pady=5, ipady=4)
-        ttk.Button(panel, text="Browse", style="Cyber.TButton", command=self.browse_path).grid(row=r, column=2, sticky="ew", padx=18, pady=5)
+        self.drive_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_drive_details_panel(), add="+")
+        target_buttons = tk.Frame(panel, bg=CYBER_PANEL)
+        target_buttons.grid(row=r, column=2, sticky="ew", padx=18, pady=5)
+        target_buttons.grid_columnconfigure((0, 1), weight=1)
+        ttk.Button(target_buttons, text="Browse", style="Cyber.TButton", command=self.browse_path).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(target_buttons, text="Refresh", style="Cyber.TButton", command=self.refresh_drives).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        r += 1
+        self.drive_details_var = tk.StringVar(value="Drive details will appear after discovery.")
+        tk.Label(
+            panel,
+            textvariable=self.drive_details_var,
+            bg=INPUT_BG,
+            fg=INPUT_FG,
+            font=("Consolas", 9),
+            justify="left",
+            anchor="w",
+            wraplength=1000,
+            padx=10,
+            pady=8,
+            highlightbackground=INPUT_BORDER,
+            highlightthickness=1,
+        ).grid(row=r, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 10))
         r += 1
         tk.Label(panel, text="Advertised GB", bg=CYBER_PANEL, fg=CYBER_MUTED).grid(row=r, column=0, sticky="w", padx=18, pady=5)
         self.advertised_var = tk.StringVar(value="")
@@ -2261,6 +3829,8 @@ class CyberStorageVerifierApp(tk.Tk):
         canvas.configure(yscrollcommand=scroll.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+        self.bind_mousewheel(canvas, canvas)
+        self.bind_mousewheel(self.reports_dashboard, canvas)
         self.reports_canvas = canvas
 
         def resize_dashboard(_event=None):
@@ -2559,6 +4129,200 @@ class CyberStorageVerifierApp(tk.Tk):
         self.session_combo = self.cyber_combo(tab, variable=self.session_var)
         self.session_combo.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8), ipady=4)
 
+    def create_health_history_tab(self):
+        tab = self.tabs["Health History"]
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        top = tk.Frame(tab, bg=CYBER_BG)
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        ttk.Button(top, text="Refresh Health History", style="Cyber.TButton", command=self.refresh_health_history).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Open Reports Folder", style="Cyber.TButton", command=lambda: self.open_file(str(ensure_reports_dir()))).pack(side="left", padx=8)
+        self.health_history_text = self.make_text(tab)
+        self.health_history_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.refresh_health_history()
+
+    def create_health_diagnostics_tab(self):
+        tab = self.tabs["Storage Health & Diagnostics"]
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        self.health_tab_canvas = tk.Canvas(tab, bg=CYBER_BG, highlightthickness=0, bd=0)
+        self.health_tab_scrollbar = ttk.Scrollbar(tab, orient="vertical", command=self.health_tab_canvas.yview, style="Cyber.Vertical.TScrollbar")
+        self.health_tab_canvas.configure(yscrollcommand=self.health_tab_scrollbar.set)
+        self.health_tab_canvas.grid(row=0, column=0, sticky="nsew")
+        self.health_tab_scrollbar.grid(row=0, column=1, sticky="ns")
+        body = tk.Frame(self.health_tab_canvas, bg=CYBER_BG)
+        self.health_tab_body = body
+        self.health_tab_window = self.health_tab_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.grid_columnconfigure(0, weight=1)
+        body.bind("<Configure>", self._update_health_tab_scroll_region)
+        self.health_tab_canvas.bind("<Configure>", self.on_health_tab_resize)
+        self.bind_mousewheel(self.health_tab_canvas, self.health_tab_canvas)
+        self.bind_mousewheel(body, self.health_tab_canvas)
+
+        warning = self.make_panel(body)
+        warning.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        warning.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            warning,
+            text="STORAGE HEALTH & DIAGNOSTICS",
+            bg=CYBER_PANEL,
+            fg=CYBER_CYAN,
+            font=("Consolas", 16, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        tk.Label(
+            warning,
+            text="Automatic read-only health overview for all detected storage devices. Diagnostics only: no repair, no formatting, no firmware operations, and no destructive disk actions.",
+            bg=CYBER_PANEL,
+            fg=INPUT_FG,
+            font=("Segoe UI", 10),
+            wraplength=1180,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+
+        summary = tk.Frame(body, bg=CYBER_BG)
+        summary.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
+        self.drive_health_summary_frame = summary
+        self.drive_health_summary_cards = {}
+        self.drive_health_summary_items = []
+        for idx, (title, value, color) in enumerate(
+            [
+                ("Total Drives", "0", CYBER_CYAN),
+                ("Healthy", "0", CYBER_GREEN),
+                ("Warning", "0", CYBER_YELLOW),
+                ("Critical", "0", CYBER_RED),
+                ("Unknown", "0", CYBER_BLUE),
+            ]
+        ):
+            card = self.make_card(summary, title, value, color)
+            card.grid(row=0, column=idx, sticky="ew", padx=4, pady=4)
+            card.grid_propagate(False)
+            card.configure(width=190, height=86)
+            self.drive_health_summary_cards[title] = card
+            self.drive_health_summary_items.append(card)
+
+        dashboard_actions = self.make_panel(body)
+        dashboard_actions.grid(row=2, column=0, sticky="ew", padx=8, pady=6)
+        dashboard_actions.grid_columnconfigure(0, weight=1)
+        dashboard_actions.grid_columnconfigure(1, weight=0)
+        self.drive_health_status_var = tk.StringVar(value="Drive health dashboard is loading...")
+        tk.Label(
+            dashboard_actions,
+            textvariable=self.drive_health_status_var,
+            bg=CYBER_PANEL,
+            fg=CYBER_CYAN,
+            font=("Consolas", 11, "bold"),
+            wraplength=760,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=12)
+        btns = tk.Frame(dashboard_actions, bg=CYBER_PANEL)
+        self.drive_health_dashboard_buttons_frame = btns
+        btns.grid(row=0, column=1, sticky="e", padx=12, pady=8)
+        self.drive_health_dashboard_buttons = []
+        for idx, (label, command) in enumerate(
+            [
+                ("Refresh All Drives", self.refresh_all_drive_health),
+                ("Rescan Selected Drive", self.rescan_selected_drive_health),
+                ("Export Health Report", self.export_health_report),
+            ]
+        ):
+            btn = ttk.Button(btns, text=label, style="Cyber.TButton", command=command)
+            btn.grid(row=0, column=idx, sticky="ew", padx=4)
+            Tooltip(btn, "Safe read-only dashboard action. No repair, format, firmware, or low-level disk operation is performed.")
+            self.drive_health_dashboard_buttons.append(btn)
+
+        dash = tk.Frame(body, bg=CYBER_BG)
+        dash.grid(row=3, column=0, sticky="nsew", padx=8, pady=6)
+        self.health_dashboard_region = dash
+        dash.grid_columnconfigure(0, weight=3)
+        dash.grid_columnconfigure(1, weight=2)
+        dash.grid_rowconfigure(0, weight=1)
+
+        cards_shell = tk.Frame(dash, bg=INPUT_BORDER, highlightbackground=INPUT_BORDER, highlightthickness=1)
+        self.drive_health_cards_shell = cards_shell
+        cards_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        cards_shell.grid_columnconfigure(0, weight=1)
+        cards_shell.grid_rowconfigure(0, weight=1)
+        self.drive_health_canvas = tk.Canvas(cards_shell, bg=CYBER_BG, highlightthickness=0, bd=0, height=390)
+        self.drive_health_scrollbar = ttk.Scrollbar(cards_shell, orient="vertical", command=self.drive_health_canvas.yview, style="Cyber.Vertical.TScrollbar")
+        self.drive_health_canvas.configure(yscrollcommand=self.drive_health_scrollbar.set)
+        self.drive_health_canvas.grid(row=0, column=0, sticky="nsew")
+        self.drive_health_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.drive_health_grid = tk.Frame(self.drive_health_canvas, bg=CYBER_BG)
+        self.drive_health_canvas_window = self.drive_health_canvas.create_window((0, 0), window=self.drive_health_grid, anchor="nw")
+        self.drive_health_grid.bind("<Configure>", lambda _event: self.drive_health_canvas.configure(scrollregion=self.drive_health_canvas.bbox("all")))
+        self.drive_health_canvas.bind("<Configure>", self._resize_drive_health_canvas_window)
+        self.bind_mousewheel(self.drive_health_canvas, self.drive_health_canvas)
+        self.bind_mousewheel(self.drive_health_grid, self.drive_health_canvas)
+
+        details = self.make_panel(dash)
+        self.drive_health_details_panel = details
+        details.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        details.grid_columnconfigure(0, weight=1)
+        details.grid_rowconfigure(1, weight=1)
+        tk.Label(details, text="SELECTED DRIVE DETAILS", bg=CYBER_PANEL, fg=CYBER_CYAN, font=("Consolas", 12, "bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 8))
+        self.drive_health_details_text = self.make_text(details, height=18)
+        self.drive_health_details_text.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.set_text(self.drive_health_details_text, "Select a storage device card to view full health details.\n")
+
+        cards = tk.Frame(body, bg=CYBER_BG)
+        cards.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
+        self.manual_health_cards_frame = cards
+        self.health_cards = {}
+        self.manual_health_card_items = []
+        health_specs = [
+            ("Health Status", "Not Checked", CYBER_CYAN),
+            ("SMART Status", "Not Checked", CYBER_PURPLE),
+            ("Windows Health", "Not Checked", CYBER_BLUE),
+            ("Temperature", "Unknown", CYBER_YELLOW),
+            ("Wear / Age", "Unknown", CYBER_GREEN),
+            ("Read Stability", "Not Checked", CYBER_CYAN),
+            ("Health Risk Score", "0 / 100", CYBER_GREEN),
+        ]
+        for idx, (title, value, color) in enumerate(health_specs):
+            card = self.make_card(cards, title, value, color)
+            card.grid(row=0, column=idx, sticky="ew", padx=4, pady=4)
+            card.grid_propagate(False)
+            card.configure(width=190, height=86)
+            self.health_cards[title] = card
+            self.manual_health_card_items.append(card)
+
+        actions = self.make_panel(body)
+        actions.grid(row=5, column=0, sticky="ew", padx=8, pady=6)
+        self.manual_health_actions_frame = actions
+        self.manual_health_action_buttons = []
+        buttons = [
+            ("Refresh Health", self.refresh_health),
+            ("Run SMART Check", self.run_health_smart),
+            ("Run Windows Health Check", self.run_health_windows),
+            ("Run Read-Only CHKDSK", self.run_health_chkdsk),
+            ("Run Surface Read Stability Scan", self.run_health_surface),
+            ("Cancel Health Diagnostic", self.cancel_health_diagnostic),
+            ("Export Health Report", self.export_health_report),
+        ]
+        for idx, (label, command) in enumerate(buttons):
+            btn = ttk.Button(actions, text=label, style="Cyber.TButton", command=command)
+            btn.grid(row=0, column=idx, sticky="ew", padx=6, pady=12)
+            Tooltip(btn, "Safe read-only diagnostic action. No repair, format, firmware, or low-level disk operation is performed.")
+            self.manual_health_action_buttons.append(btn)
+
+        output_panel = self.make_panel(body)
+        output_panel.grid(row=6, column=0, sticky="nsew", padx=8, pady=(6, 8))
+        output_panel.grid_columnconfigure(0, weight=1)
+        output_panel.grid_rowconfigure(1, weight=1)
+        top = tk.Frame(output_panel, bg=CYBER_PANEL)
+        top.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
+        top.grid_columnconfigure(0, weight=1)
+        self.health_status_var = tk.StringVar(value="Storage health diagnostics are idle.")
+        tk.Label(top, textvariable=self.health_status_var, bg=CYBER_PANEL, fg=CYBER_CYAN, font=("Consolas", 12, "bold")).grid(row=0, column=0, sticky="w")
+        self.health_progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(top, variable=self.health_progress_var, maximum=100, style="Neon.Horizontal.TProgressbar").grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.health_output_text = self.make_text(output_panel, height=18)
+        self.health_output_text.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.set_text(self.health_output_text, "Select a target drive, then run a safe diagnostic action.\n")
+        self.bind_mousewheel_recursive(body, self.health_tab_canvas)
+        self.rebuild_health_dashboard_layout()
+
     def create_help_tab(self):
         tab = self.tabs["Help Center"]
         tab.grid_columnconfigure(1, weight=1)
@@ -2589,9 +4353,23 @@ class CyberStorageVerifierApp(tk.Tk):
         sidebar = self.make_panel(tab)
         sidebar.grid(row=1, column=0, sticky="nsew", padx=(8, 6), pady=(0, 8))
         sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(1, weight=1)
         tk.Label(sidebar, text="TOPICS", bg=CYBER_PANEL, fg=CYBER_CYAN, font=("Consolas", 12, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
-        self.help_nav_frame = tk.Frame(sidebar, bg=CYBER_PANEL)
-        self.help_nav_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        nav_shell = tk.Frame(sidebar, bg=CYBER_PANEL)
+        nav_shell.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        nav_shell.grid_columnconfigure(0, weight=1)
+        nav_shell.grid_rowconfigure(0, weight=1)
+        self.help_nav_canvas = tk.Canvas(nav_shell, bg=CYBER_PANEL, highlightthickness=0, bd=0, width=230)
+        self.help_nav_scrollbar = ttk.Scrollbar(nav_shell, orient="vertical", command=self.help_nav_canvas.yview, style="Cyber.Vertical.TScrollbar")
+        self.help_nav_canvas.configure(yscrollcommand=self.help_nav_scrollbar.set)
+        self.help_nav_canvas.grid(row=0, column=0, sticky="nsew")
+        self.help_nav_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.help_nav_frame = tk.Frame(self.help_nav_canvas, bg=CYBER_PANEL)
+        self.help_nav_window = self.help_nav_canvas.create_window((0, 0), window=self.help_nav_frame, anchor="nw")
+        self.help_nav_frame.bind("<Configure>", self._update_help_nav_scroll_region)
+        self.help_nav_canvas.bind("<Configure>", self._resize_help_nav_canvas_window)
+        self.bind_mousewheel(self.help_nav_canvas, self.help_nav_canvas)
+        self.bind_mousewheel(self.help_nav_frame, self.help_nav_canvas)
 
         content_shell = tk.Frame(tab, bg=INPUT_BORDER, highlightbackground=INPUT_BORDER, highlightthickness=1)
         content_shell.grid(row=1, column=1, sticky="nsew", padx=(6, 8), pady=(0, 8))
@@ -2606,16 +4384,20 @@ class CyberStorageVerifierApp(tk.Tk):
         self.help_canvas_window = self.help_canvas.create_window((0, 0), window=self.help_content_frame, anchor="nw")
         self.help_content_frame.bind("<Configure>", self._update_help_scroll_region)
         self.help_canvas.bind("<Configure>", self._resize_help_canvas_window)
-        self.help_canvas.bind_all("<MouseWheel>", self._help_mousewheel)
+        self.bind_mousewheel(self.help_canvas, self.help_canvas)
+        self.bind_mousewheel(self.help_content_frame, self.help_canvas)
         self.help_search_var.trace_add("write", lambda *_: self.refresh_help_content())
         self.help_sections_open = {}
         self.help_section_widgets = {}
+        self.show_older_changelog_versions = False
         self.refresh_help_content()
 
     def get_help_sections(self):
         py_version = sys.version.split()[0]
         os_label = f"{platform.system()} {platform.release()} ({platform.version()})"
         smart_state = "Available" if smartctl_available() else "Not detected"
+        pdf_engines = pdf_engine_available()
+        pdf_state = ", ".join(pdf_engines) if pdf_engines else "Unavailable"
         return [
             (
                 "Introduction",
@@ -2728,6 +4510,20 @@ class CyberStorageVerifierApp(tk.Tk):
                 "info",
             ),
             (
+                "Storage Health & Diagnostics",
+                "Read-only health analysis module",
+                [
+                    "The Storage Health & Diagnostics tab adds safe, read-only health checks beside the authenticity scanner.",
+                    "SMART Health Analyzer uses smartctl -H and smartctl -a when smartmontools is installed, then parses reallocated sectors, pending sectors, uncorrectable sectors, CRC errors, power-on hours, temperature, wear, and NVMe media errors.",
+                    "Windows Health Analyzer uses read-only PowerShell commands: Get-PhysicalDisk, Get-Disk, Get-Volume, and Get-StorageReliabilityCounter where available.",
+                    "Run Read-Only File System Check executes chkdsk X: only. It never uses /f, /r, format, diskpart clean, repair-volume -repair, or low-level disk operations.",
+                    "Surface Read Stability Scan reads existing files only. It reports slow regions, read errors, latency spikes, and speed collapse signals without writing or repairing anything.",
+                    "Health Risk Score is separate from the authenticity risk score and should be used for backup, monitoring, and replacement decisions.",
+                    "Professional recommendations include No major health issues detected, Monitor this device, Backup recommended, Replacement recommended, and Do not rely on this device for important data.",
+                ],
+                "warning",
+            ),
+            (
                 "Risk Score Explanation",
                 "How to interpret the verdict",
                 [
@@ -2820,7 +4616,7 @@ class CyberStorageVerifierApp(tk.Tk):
                 "About the author",
                 [
                     "Application Name: Cyber Storage Verifier",
-                    "Developer: Rush",
+                    "Developer: Rushab",
                     f"Version: {APP_VERSION}",
                     f"Python Runtime: {py_version}",
                     f"Operating System: {os_label}",
@@ -2832,41 +4628,55 @@ class CyberStorageVerifierApp(tk.Tk):
                 "credit",
             ),
             (
-                "Version Information",
-                "Build and runtime details",
-                [
-                    f"Application: {APP_NAME}",
-                    f"Version: {APP_VERSION}",
-                    f"Build Time: Runtime build on {now_stamp()}",
-                    f"Python: {sys.version}",
-                    f"Platform: {platform.platform()}",
-                    f"Executable: {sys.executable}",
-                    "Compatibility Target: Windows 11 with Python 3.9+.",
-                ],
-                "info",
-            ),
-            (
-                "Changelog / Update Notes",
-                "Major feature history",
-                [
-                    "v2.0: Added resumable block scan sessions, JSON checkpoints, per-block metadata, random rechecks, delayed verification, scan history, and multi-format forensic reports.",
-                    "v2.0: Added Quick, Balanced, Deep, Full Capacity Validation, Random Spot Check, Fake-Capacity Boundary, and Quick Health scan modes.",
-                    "v2.0: Added enterprise-style cyber-themed tabbed UI, dashboard cards, active telemetry views, settings panels, improved input styling, and safer cleanup handling.",
-                    "v2.0: Improved metadata analysis, SMART integration, speed anomaly detection, corruption intelligence, risk categories, and forensic report conclusions.",
-                    "v2.0: Added real-time processed, verified, corrupted, failed, and read-failure telemetry synchronization.",
-                    "v2.0: Added advanced corruption analytics including corruption percentage tracking, consecutive corruption detection, corruption start offset analysis, and estimated authentic usable capacity detection.",
-                    "v2.0: Added SHA-256 mismatch evidence tracking, verified/corrupted/failed range mapping, fake-capacity boundary intelligence, and forensic evidence preservation.",
-                    "v2.0: Added partial scan finalization with support for interrupted scans, Stop Scan, Cancel, Emergency Stop, and severe corruption auto-stop recovery.",
-                    "v2.0: Added advanced cyber-forensic HTML dashboard reports with storage authenticity visualization maps, risk indicator widgets, corruption analytics, and forensic warning panels.",
-                    "v2.0: Added professional PDF forensic report export support with enhanced dashboard rendering and evidence presentation.",
-                    "v2.0: Improved Active Scan UI with live corruption visualization, processed vs verified telemetry tracking, warning banners, stabilized ETA calculations, and live findings updates.",
-                    "v2.0: Enhanced TXT, JSON, CSV, HTML, and PDF reporting engines with interruption-aware evidence preservation and forensic telemetry rendering.",
-                    "v2.0: Improved finalize() reliability, finish_session() synchronization, resumable checkpoint recovery, corruption persistence tracking, and overall scan stability.",
-                    "v2.0 Help Center: Added integrated documentation, searchable help system, collapsible sections, exports, shortcuts, onboarding, context help, and developer credits.",
-                    
-                ],
-                "credit",
-            ),
+    "Changelog / Update Notes",
+    "Major feature history",
+    [
+        "v2.1 - Latest Release: Storage Health & Diagnostics, SMART Dashboard, Full Details Viewer, and Responsive Health UI",
+
+        "v2.1: Added advanced Storage Health & Diagnostics dashboard with automatic multi-drive health discovery, live device telemetry monitoring, and enterprise-style cyber-themed diagnostics UI.",
+        "v2.1: Added fully responsive health diagnostics layout engine with adaptive drive-card rendering, automatic grid resizing, dynamic stacking behavior, scrollable containers, and compact-window optimization.",
+        "v2.1: Added intelligent drive identity discovery with automatic detection of drive model, manufacturer, firmware version, serial number, filesystem, bus/interface type, media classification, and physical storage metadata.",
+        "v2.1: Added professional drive health cards with dynamic health score visualization, cyber-themed status badges, responsive telemetry widgets, live SMART summaries, and risk indicator rendering.",
+        "v2.1: Added advanced SMART diagnostics engine with automatic smartctl discovery, SMART parsing, Windows-to-SMART device mapping intelligence, confidence scoring, and read-only hardware health analysis.",
+        "v2.1: Added enhanced Windows storage telemetry integration using Get-Disk, Get-PhysicalDisk, Get-Volume, and Get-StorageReliabilityCounter for deeper reliability diagnostics and health-state monitoring.",
+        "v2.1: Added automatic SSD/HDD/NVMe/USB/removable-media classification with intelligent badge rendering and storage-type-specific telemetry presentation.",
+        "v2.1: Added intelligent device-aware telemetry handling with automatic fallback wording such as 'Mechanical HDD', 'Not Exposed', 'USB Bridge Hidden', and 'SMART Unavailable' instead of generic unknown states.",
+        "v2.1: Added NVMe and SSD wear-level analysis using Percentage Used, Wear_Leveling_Count, Media_Wearout_Indicator, Percent_Lifetime_Remain, and Windows reliability wear telemetry.",
+        "v2.1: Added HDD-specific reliability analysis including reallocated sectors, pending sectors, offline uncorrectable sectors, CRC errors, power-on hours, start/stop counts, and mechanical-drive health interpretation.",
+        "v2.1: Added advanced predictive health risk scoring engine with failure-intelligence logic based on SMART degradation indicators, SSD wear levels, temperature anomalies, CRC instability, and media/data integrity errors.",
+        "v2.1: Added live temperature telemetry, wear-level tracking, SMART attribute monitoring, Windows health synchronization, power-cycle analysis, and power-on-hours telemetry integration.",
+        "v2.1: Added read-only surface read stability diagnostics with latency anomaly analysis, slow-region detection, timeout intelligence, sampled stability scoring, and non-destructive read verification.",
+        "v2.1: Added read-only CHKDSK preview integration with filesystem warning analysis, safer diagnostics-only execution, and non-destructive filesystem integrity inspection.",
+        "v2.1: Added complete 'View Full Details' diagnostics window with responsive Toplevel UI, tabbed forensic telemetry views, SMART tables, health-analysis panels, raw SMART viewers, and diagnostic history rendering.",
+        "v2.1: Added dedicated Overview, SMART Details, Health Analysis, Surface Stability, Raw SMART Output, and History/Timeline tabs for expanded forensic storage analysis.",
+        "v2.1: Added raw SMART output viewer with scrollable forensic telemetry rendering, copy-to-clipboard support, and raw smartctl evidence inspection.",
+        "v2.1: Added advanced SMART attribute parsing for Spin_Retry_Count, Seek_Error_Rate, Start_Stop_Count, Load_Cycle_Count, Unsafe Shutdowns, Available Spare, Controller Busy Time, Host Read Commands, and Host Write Commands.",
+        "v2.1: Added intelligent SMART-device confidence matching using serial numbers, drive models, bus types, physical drive numbers, and metadata correlation logic.",
+        "v2.1: Added single-drive forensic report export support for TXT, JSON, HTML, and PDF formats directly from the full diagnostics viewer.",
+        "v2.1: Added drive-specific recommendation engine with contextual health guidance such as backup recommendations, thermal warnings, SMART degradation alerts, and mechanical-drive advisories.",
+        "v2.1: Added enterprise-style health summary telemetry widgets for total drives, healthy devices, warning devices, critical-risk devices, and unknown-state tracking.",
+        "v2.1: Added safer diagnostics-only architecture with explicit prevention of destructive operations, firmware modification, raw-disk writes, formatting, repair-volume actions, and bad-sector repair execution.",
+        "v2.1: Added improved report/export reliability with enhanced storage-health rendering, SMART evidence preservation, interruption-aware exports, and advanced telemetry presentation.",
+        "v2.1: Added extensive health diagnostics unit testing including SMART parser validation, device-aware fallback handling, uncertain SMART mapping detection, full-details-window testing, export validation, and HDD/NVMe telemetry rendering verification.",
+        "v2.1: Improved drive discovery reliability, metadata caching, PowerShell integration stability, smartctl matching accuracy, responsive UI scaling, diagnostics performance, and overall application stability.",
+
+        "v2.0: Added resumable block scan sessions, JSON checkpoints, per-block metadata, random rechecks, delayed verification, scan history, and multi-format forensic reports.",
+        "v2.0: Added Quick, Balanced, Deep, Full Capacity Validation, Random Spot Check, Fake-Capacity Boundary, and Quick Health scan modes.",
+        "v2.0: Added enterprise-style cyber-themed tabbed UI, dashboard cards, active telemetry views, settings panels, improved input styling, and safer cleanup handling.",
+        "v2.0: Improved metadata analysis, SMART integration, speed anomaly detection, corruption intelligence, risk categories, and forensic report conclusions.",
+        "v2.0: Added real-time processed, verified, corrupted, failed, and read-failure telemetry synchronization.",
+        "v2.0: Added advanced corruption analytics including corruption percentage tracking, consecutive corruption detection, corruption start offset analysis, and estimated authentic usable capacity detection.",
+        "v2.0: Added SHA-256 mismatch evidence tracking, verified/corrupted/failed range mapping, fake-capacity boundary intelligence, and forensic evidence preservation.",
+        "v2.0: Added partial scan finalization with support for interrupted scans, Stop Scan, Cancel, Emergency Stop, and severe corruption auto-stop recovery.",
+        "v2.0: Added advanced cyber-forensic HTML dashboard reports with storage authenticity visualization maps, risk indicator widgets, corruption analytics, and forensic warning panels.",
+        "v2.0: Added professional PDF forensic report export support with enhanced dashboard rendering and evidence presentation.",
+        "v2.0: Improved Active Scan UI with live corruption visualization, processed vs verified telemetry tracking, warning banners, stabilized ETA calculations, and live findings updates.",
+        "v2.0: Enhanced TXT, JSON, CSV, HTML, and PDF reporting engines with interruption-aware evidence preservation and forensic telemetry rendering.",
+        "v2.0: Improved finalize() reliability, finish_session() synchronization, resumable checkpoint recovery, corruption persistence tracking, and overall scan stability.",
+        "v2.0 Help Center: Added integrated documentation, searchable help system, collapsible sections, exports, shortcuts, onboarding, context help, and developer credits.",
+    ],
+    "credit",
+),
         ]
 
     def refresh_help_content(self):
@@ -2888,9 +4698,11 @@ class CyberStorageVerifierApp(tk.Tk):
         for idx, (title, subtitle, lines, kind) in enumerate(sections):
             nav = ttk.Button(self.help_nav_frame, text=title, style="Cyber.TButton", command=lambda t=title: self.jump_to_help_section(t))
             nav.grid(row=idx, column=0, sticky="ew", pady=3)
+            self.bind_mousewheel(nav, self.help_nav_canvas)
             self.help_nav_frame.grid_columnconfigure(0, weight=1)
             self.add_help_section(self.help_content_frame, title, subtitle, lines, kind, idx)
         self.help_content_frame.update_idletasks()
+        self._update_help_nav_scroll_region()
         self.help_canvas.yview_moveto(0)
 
     def add_help_section(self, parent, title, subtitle, lines, kind, row):
@@ -2920,14 +4732,94 @@ class CyberStorageVerifierApp(tk.Tk):
             bd=0,
         )
         header.grid(row=0, column=0, sticky="ew")
+        self.bind_mousewheel(header, self.help_canvas)
         subtitle_lbl = tk.Label(panel, text=subtitle, bg=CYBER_PANEL, fg=INPUT_MUTED, font=("Segoe UI", 9, "bold"), anchor="w")
         subtitle_lbl.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        self.bind_mousewheel(subtitle_lbl, self.help_canvas)
         body = tk.Frame(panel, bg=CYBER_PANEL)
         if is_open:
             body.grid(row=2, column=0, sticky="ew")
-        box = self.help_info_box(body, lines, kind)
+        if title == "Changelog / Update Notes":
+            box = self.render_changelog_section(body, lines)
+        else:
+            box = self.help_info_box(body, lines, kind)
         box.pack(fill="x", expand=True)
+        self.bind_mousewheel_recursive(panel, self.help_canvas)
         self.help_section_widgets[title] = {"panel": panel, "body": body, "header": header}
+
+    def render_changelog_section(self, parent, lines):
+        frame = tk.Frame(parent, bg="#081526", highlightbackground=CYBER_GREEN, highlightthickness=1, padx=12, pady=10)
+        query = self.help_search_var.get().strip().lower() if hasattr(self, "help_search_var") else ""
+        latest_items = [line for line in lines if str(line).startswith("v2.1")]
+        older_items = [line for line in lines if str(line).startswith("v2.0")]
+        show_older = bool(query) or self.show_older_changelog_versions
+
+        row = 0
+        tk.Label(
+            frame,
+            text="v2.1 - Latest Release",
+            bg="#081526",
+            fg=CYBER_GREEN,
+            font=("Consolas", 12, "bold"),
+            anchor="w",
+        ).grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        row += 1
+        for line in latest_items:
+            lbl = tk.Label(
+                frame,
+                text=f">> {line}",
+                bg="#081526",
+                fg=INPUT_FG,
+                font=("Segoe UI", 10),
+                justify="left",
+                anchor="w",
+                wraplength=920,
+            )
+            lbl.grid(row=row, column=0, sticky="ew", pady=2)
+            self.bind_mousewheel(lbl, self.help_canvas if hasattr(self, "help_canvas") else frame)
+            row += 1
+
+        btn_text = "Hide Older Versions" if self.show_older_changelog_versions else "Show Older Versions"
+        if not query:
+            toggle = ttk.Button(frame, text=btn_text, style="Cyber.TButton", command=self.toggle_older_changelog_versions)
+            toggle.grid(row=row, column=0, sticky="w", pady=(12, 8))
+            self.bind_mousewheel(toggle, self.help_canvas if hasattr(self, "help_canvas") else frame)
+            row += 1
+
+        if show_older:
+            tk.Label(
+                frame,
+                text="v2.0 - Older Version",
+                bg="#081526",
+                fg=CYBER_CYAN,
+                font=("Consolas", 12, "bold"),
+                anchor="w",
+            ).grid(row=row, column=0, sticky="ew", pady=(8, 8))
+            row += 1
+            for line in older_items:
+                if query and query not in line.lower() and query not in "changelog update notes older version v2.0".lower():
+                    continue
+                lbl = tk.Label(
+                    frame,
+                    text=f">> {line}",
+                    bg="#081526",
+                    fg=INPUT_FG,
+                    font=("Segoe UI", 10),
+                    justify="left",
+                    anchor="w",
+                    wraplength=920,
+                )
+                lbl.grid(row=row, column=0, sticky="ew", pady=2)
+                self.bind_mousewheel(lbl, self.help_canvas if hasattr(self, "help_canvas") else frame)
+                row += 1
+
+        frame.grid_columnconfigure(0, weight=1)
+        return frame
+
+    def toggle_older_changelog_versions(self):
+        self.show_older_changelog_versions = not getattr(self, "show_older_changelog_versions", False)
+        self.refresh_help_content()
+        self.jump_to_help_section("Changelog / Update Notes")
 
     def help_info_box(self, parent, lines, kind):
         accent = {"info": CYBER_CYAN, "warning": CYBER_YELLOW, "danger": CYBER_RED, "credit": CYBER_GREEN}.get(kind, CYBER_CYAN)
@@ -2946,6 +4838,7 @@ class CyberStorageVerifierApp(tk.Tk):
                 wraplength=920,
             )
             lbl.grid(row=i, column=0, sticky="ew", pady=2)
+            self.bind_mousewheel(lbl, self.help_canvas if hasattr(self, "help_canvas") else frame)
         frame.grid_columnconfigure(0, weight=1)
         return frame
 
@@ -2977,9 +4870,13 @@ class CyberStorageVerifierApp(tk.Tk):
     def _resize_help_canvas_window(self, event):
         self.help_canvas.itemconfigure(self.help_canvas_window, width=event.width)
 
-    def _help_mousewheel(self, event):
-        if self.notebook.select() == str(self.tabs["Help Center"]):
-            self.help_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    def _update_help_nav_scroll_region(self, _event=None):
+        if hasattr(self, "help_nav_canvas"):
+            self.help_nav_canvas.configure(scrollregion=self.help_nav_canvas.bbox("all"))
+
+    def _resize_help_nav_canvas_window(self, event):
+        if hasattr(self, "help_nav_canvas"):
+            self.help_nav_canvas.itemconfigure(self.help_nav_window, width=event.width)
 
     def help_plain_text(self):
         chunks = [f"{APP_NAME} v{APP_VERSION} Help Center", f"Generated: {now_stamp()}", ""]
@@ -3104,6 +5001,9 @@ li{{margin:7px 0}} code{{color:#39FF88}}
             ("Delayed Verify Sec", "delayed_verify_seconds", tk.StringVar(value=str(self.settings.delayed_verify_seconds))),
             ("Random Recheck %", "random_recheck_percent", tk.StringVar(value=str(self.settings.random_recheck_percent))),
             ("Severe Corruption Stop Blocks", "severe_corruption_blocks", tk.StringVar(value=str(self.settings.severe_corruption_blocks))),
+            ("Surface Scan Max MB", "surface_scan_max_mb", tk.StringVar(value=str(self.settings.surface_scan_max_mb))),
+            ("Surface Chunk MB", "surface_scan_chunk_mb", tk.StringVar(value=str(self.settings.surface_scan_chunk_mb))),
+            ("Surface Max Seconds", "surface_scan_max_seconds", tk.StringVar(value=str(self.settings.surface_scan_max_seconds))),
         ]
         self.setting_vars = {}
         r = 1
@@ -3158,13 +5058,44 @@ li{{margin:7px 0}} code{{color:#39FF88}}
 
         text.bind("<FocusIn>", focus_in, add="+")
         text.bind("<FocusOut>", focus_out, add="+")
+        self.bind_mousewheel(text, text)
+        self.bind_mousewheel(frame, text)
         return frame
+
+    def bind_mousewheel(self, widget, target, horizontal=False):
+        def on_mousewheel(event):
+            delta = event.delta
+            if delta == 0 and hasattr(event, "num"):
+                delta = 120 if event.num == 4 else -120
+            units = int(-1 * (delta / 120)) if delta else 0
+            if units == 0:
+                units = -1 if delta > 0 else 1
+            try:
+                if horizontal:
+                    target.xview_scroll(units, "units")
+                else:
+                    target.yview_scroll(units, "units")
+            except Exception:
+                return None
+            return "break"
+
+        widget.bind("<MouseWheel>", on_mousewheel, add="+")
+        widget.bind("<Button-4>", on_mousewheel, add="+")
+        widget.bind("<Button-5>", on_mousewheel, add="+")
+
+    def bind_mousewheel_recursive(self, widget, target):
+        self.bind_mousewheel(widget, target)
+        for child in widget.winfo_children():
+            self.bind_mousewheel_recursive(child, target)
 
     def text_widget(self, frame):
         return frame.winfo_children()[0]
 
     def set_text(self, frame, content):
         text = self.text_widget(frame)
+        content = str(content)
+        if len(content) > MAX_TEXT_WIDGET_CHARS:
+            content = content[:6000] + "\n\n[Output truncated in UI. Full output is preserved in reports where applicable.]\n\n" + content[-(MAX_TEXT_WIDGET_CHARS - 6200):]
         text.configure(state="normal")
         text.delete("1.0", tk.END)
         text.insert(tk.END, content)
@@ -3174,6 +5105,9 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         text = self.text_widget(frame)
         text.configure(state="normal")
         text.insert(tk.END, content)
+        current_chars = int(float(text.index("end-1c").split(".")[0])) * 120
+        if current_chars > MAX_TEXT_WIDGET_CHARS:
+            text.delete("1.0", "200.0")
         text.see(tk.END)
         text.configure(state="disabled")
 
@@ -3257,6 +5191,1334 @@ li{{margin:7px 0}} code{{color:#39FF88}}
     def metric_callback(self, metrics):
         self.metric_queue.put(metrics)
 
+    def health_log_callback(self, message):
+        logging.info(message)
+        self.health_queue.put({"type": "log", "message": message})
+
+    def health_status_callback(self, message):
+        self.health_queue.put({"type": "status", "message": message})
+
+    def health_progress_callback(self, value):
+        self.health_queue.put({"type": "progress", "value": value})
+
+    def selected_health_target(self):
+        return self.get_selected_target_path() if hasattr(self, "drive_var") and self.drive_var.get() else (get_windows_drives()[0] if get_windows_drives() else "/")
+
+    def _update_health_tab_scroll_region(self, _event=None):
+        if hasattr(self, "health_tab_canvas"):
+            self.health_tab_canvas.configure(scrollregion=self.health_tab_canvas.bbox("all"))
+
+    def on_health_tab_resize(self, event=None):
+        if hasattr(self, "health_tab_canvas") and hasattr(self, "health_tab_window"):
+            width = event.width if event else self.health_tab_canvas.winfo_width()
+            self.health_tab_canvas.itemconfigure(self.health_tab_window, width=max(1, width))
+        self.rebuild_health_dashboard_layout()
+
+    def calculate_health_card_columns(self, width, min_width=210, max_columns=5):
+        usable = max(1, int(width or 1) - 32)
+        return max(1, min(max_columns, usable // max(1, min_width)))
+
+    def wrap_grid_widgets(self, frame, widgets, columns, padx=4, pady=4, min_width=190, min_height=86):
+        if not frame:
+            return
+        for child in widgets:
+            child.grid_forget()
+        for col in range(12):
+            frame.grid_columnconfigure(col, weight=0, minsize=0)
+        columns = max(1, int(columns or 1))
+        for col in range(columns):
+            frame.grid_columnconfigure(col, weight=1, minsize=min_width)
+        for idx, widget in enumerate(widgets):
+            widget.grid(row=idx // columns, column=idx % columns, sticky="ew", padx=padx, pady=pady)
+            try:
+                widget.grid_propagate(False)
+                widget.configure(width=min_width, height=min_height)
+            except Exception:
+                pass
+
+    def wrap_health_action_buttons(self, frame, buttons, columns):
+        if not frame:
+            return
+        for button in buttons:
+            button.grid_forget()
+        for col in range(12):
+            frame.grid_columnconfigure(col, weight=0, minsize=0)
+        columns = max(1, int(columns or 1))
+        for col in range(columns):
+            frame.grid_columnconfigure(col, weight=1, minsize=180)
+        for idx, button in enumerate(buttons):
+            button.grid(row=idx // columns, column=idx % columns, sticky="ew", padx=6, pady=6)
+
+    def rebuild_health_dashboard_layout(self):
+        if not hasattr(self, "health_tab_canvas"):
+            return
+        width = self.health_tab_canvas.winfo_width() or self.winfo_width() or 1200
+        summary_cols = self.calculate_health_card_columns(width, min_width=205, max_columns=5)
+        self.wrap_grid_widgets(
+            getattr(self, "drive_health_summary_frame", None),
+            getattr(self, "drive_health_summary_items", []),
+            summary_cols,
+            min_width=195,
+            min_height=86,
+        )
+        manual_card_cols = self.calculate_health_card_columns(width, min_width=205, max_columns=4)
+        self.wrap_grid_widgets(
+            getattr(self, "manual_health_cards_frame", None),
+            getattr(self, "manual_health_card_items", []),
+            manual_card_cols,
+            min_width=195,
+            min_height=86,
+        )
+        dashboard_button_cols = 3 if width >= 920 else 2 if width >= 620 else 1
+        if hasattr(self, "drive_health_dashboard_buttons_frame"):
+            if width < 760:
+                self.drive_health_dashboard_buttons_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+            else:
+                self.drive_health_dashboard_buttons_frame.grid(row=0, column=1, sticky="e", padx=12, pady=8)
+            self.wrap_health_action_buttons(self.drive_health_dashboard_buttons_frame, self.drive_health_dashboard_buttons, dashboard_button_cols)
+        manual_button_cols = 4 if width >= 1120 else 3 if width >= 860 else 2 if width >= 620 else 1
+        self.wrap_health_action_buttons(getattr(self, "manual_health_actions_frame", None), getattr(self, "manual_health_action_buttons", []), manual_button_cols)
+
+        if hasattr(self, "health_dashboard_region") and hasattr(self, "drive_health_details_panel"):
+            region = self.health_dashboard_region
+            cards_shell = self.drive_health_cards_shell
+            details = self.drive_health_details_panel
+            cards_shell.grid_forget()
+            details.grid_forget()
+            for col in range(2):
+                region.grid_columnconfigure(col, weight=0, minsize=0)
+            if width >= 1080:
+                region.grid_columnconfigure(0, weight=3, minsize=560)
+                region.grid_columnconfigure(1, weight=2, minsize=390)
+                region.grid_rowconfigure(0, weight=1, minsize=390)
+                cards_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+                details.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
+                self.drive_health_canvas.configure(height=390)
+            else:
+                region.grid_columnconfigure(0, weight=1, minsize=0)
+                region.grid_rowconfigure(0, weight=1, minsize=390)
+                region.grid_rowconfigure(1, weight=1, minsize=300)
+                cards_shell.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 8))
+                details.grid(row=1, column=0, sticky="nsew", padx=0, pady=(8, 0))
+                self.drive_health_canvas.configure(height=430 if width >= 760 else 390)
+        if hasattr(self, "drive_health_canvas"):
+            self.render_drive_health_cards()
+        self._update_health_tab_scroll_region()
+
+    def _resize_drive_health_canvas_window(self, event=None):
+        if hasattr(self, "drive_health_canvas") and hasattr(self, "drive_health_canvas_window"):
+            width = event.width if event else self.drive_health_canvas.winfo_width()
+            self.drive_health_canvas.itemconfigure(self.drive_health_canvas_window, width=max(1, width))
+            self.render_drive_health_cards()
+
+    def refresh_all_drive_health(self):
+        if self.drive_health_thread and self.drive_health_thread.is_alive():
+            if hasattr(self, "drive_health_status_var"):
+                self.drive_health_status_var.set("Drive health dashboard is already scanning...")
+            return
+        if not hasattr(self, "drive_health_status_var"):
+            return
+        self.drive_health_loading = True
+        self.drive_health_status_var.set("Scanning drives with safe read-only diagnostics...")
+        self.render_drive_health_cards(loading=True)
+
+        def worker():
+            try:
+                snapshots = collect_all_drive_health_snapshots(log_callback=lambda msg: self.health_queue.put({"type": "log", "message": msg}))
+                self.health_queue.put({"type": "drive_health_complete", "snapshots": snapshots})
+            except Exception as exc:
+                logging.exception("Drive health dashboard refresh failed")
+                self.health_queue.put({"type": "drive_health_error", "message": f"{type(exc).__name__}: {exc}"})
+
+        self.drive_health_thread = threading.Thread(target=worker, daemon=True)
+        self.drive_health_thread.start()
+
+    def rescan_selected_drive_health(self):
+        root = self.selected_drive_health_root or self.selected_health_target()
+        if not root:
+            messagebox.showinfo("Drive Health", "Select a drive card or target drive first.")
+            return
+        if self.drive_health_thread and self.drive_health_thread.is_alive():
+            messagebox.showinfo("Drive Health", "A drive health refresh is already running.")
+            return
+        self.drive_health_status_var.set(f"Rescanning {root} with read-only diagnostics...")
+
+        def worker():
+            try:
+                snapshots = collect_all_drive_health_snapshots(
+                    log_callback=lambda msg: self.health_queue.put({"type": "log", "message": msg}),
+                    roots=[root],
+                )
+                self.health_queue.put({"type": "drive_health_partial", "snapshots": snapshots})
+            except Exception as exc:
+                logging.exception("Selected drive health refresh failed")
+                self.health_queue.put({"type": "drive_health_error", "message": f"{type(exc).__name__}: {exc}"})
+
+        self.drive_health_thread = threading.Thread(target=worker, daemon=True)
+        self.drive_health_thread.start()
+
+    def update_drive_health_dashboard(self, snapshots):
+        global LAST_HEALTH_SUMMARY
+        self.drive_health_loading = False
+        self.drive_health_snapshots = list(snapshots or [])
+        if self.drive_health_snapshots and not self.selected_drive_health_root:
+            self.selected_drive_health_root = self.drive_health_snapshots[0].root
+        if self.selected_drive_health_root and not any(s.root == self.selected_drive_health_root for s in self.drive_health_snapshots):
+            self.selected_drive_health_root = self.drive_health_snapshots[0].root if self.drive_health_snapshots else ""
+        self.update_drive_health_summary_cards()
+        self.render_drive_health_cards()
+        self.update_drive_health_details()
+        self.refresh_open_drive_detail_windows()
+        LAST_HEALTH_SUMMARY["drive_snapshots"] = [asdict(item) for item in self.drive_health_snapshots]
+        self.drive_health_status_var.set(
+            f"Last refreshed {now_stamp()} - {len(self.drive_health_snapshots)} drive(s) detected."
+            if self.drive_health_snapshots else
+            "No storage drives detected by the health dashboard."
+        )
+
+    def merge_drive_health_snapshots(self, snapshots):
+        if not snapshots:
+            return
+        existing = {item.root: item for item in self.drive_health_snapshots}
+        for snapshot in snapshots:
+            existing[snapshot.root] = snapshot
+            self.selected_drive_health_root = snapshot.root
+        ordered_roots = [item.root for item in self.drive_health_snapshots if item.root in existing]
+        for snapshot in snapshots:
+            if snapshot.root not in ordered_roots:
+                ordered_roots.append(snapshot.root)
+        self.update_drive_health_dashboard([existing[root] for root in ordered_roots])
+
+    def update_drive_health_summary_cards(self):
+        if not hasattr(self, "drive_health_summary_cards"):
+            return
+        counts = {"Total Drives": len(self.drive_health_snapshots), "Healthy": 0, "Warning": 0, "Critical": 0, "Unknown": 0}
+        for snapshot in self.drive_health_snapshots:
+            status = str(snapshot.health_status).upper()
+            if "CRITICAL" in status:
+                counts["Critical"] += 1
+            elif "WARNING" in status:
+                counts["Warning"] += 1
+            elif "GOOD" in status or "HEALTHY" in status:
+                counts["Healthy"] += 1
+            else:
+                counts["Unknown"] += 1
+        for title, value in counts.items():
+            card = self.drive_health_summary_cards.get(title)
+            if card:
+                card.value_label.config(text=str(value))
+
+    def render_drive_health_cards(self, loading=False):
+        if not hasattr(self, "drive_health_grid"):
+            return
+        for child in self.drive_health_grid.winfo_children():
+            child.destroy()
+        self.drive_health_card_widgets = {}
+        if loading:
+            tk.Label(
+                self.drive_health_grid,
+                text="Scanning drives...",
+                bg=CYBER_BG,
+                fg=CYBER_CYAN,
+                font=("Consolas", 14, "bold"),
+            ).grid(row=0, column=0, sticky="w", padx=18, pady=18)
+            return
+        if not self.drive_health_snapshots:
+            tk.Label(
+                self.drive_health_grid,
+                text="No drive health snapshots available. Click Refresh All Drives.",
+                bg=CYBER_BG,
+                fg=CYBER_MUTED,
+                font=("Segoe UI", 11),
+            ).grid(row=0, column=0, sticky="w", padx=18, pady=18)
+            return
+        width = self.drive_health_canvas.winfo_width() if hasattr(self, "drive_health_canvas") else 1000
+        columns = 2 if width >= 760 else 1
+        for col in range(4):
+            self.drive_health_grid.grid_columnconfigure(col, weight=0, minsize=0)
+        for col in range(columns):
+            self.drive_health_grid.grid_columnconfigure(col, weight=1, minsize=340)
+        for idx, snapshot in enumerate(self.drive_health_snapshots):
+            card = self.create_drive_health_card(self.drive_health_grid, snapshot)
+            card.grid(row=idx // columns, column=idx % columns, sticky="nsew", padx=8, pady=8)
+            self.drive_health_card_widgets[snapshot.root] = card
+        self.drive_health_grid.update_idletasks()
+        self.drive_health_canvas.configure(scrollregion=self.drive_health_canvas.bbox("all"))
+
+    def drive_health_card_stats(self, snapshot: DriveHealthSnapshot):
+        base = [
+            ("Capacity", human_bytes(snapshot.capacity)),
+            ("Free", human_bytes(snapshot.free)),
+            ("Interface", snapshot.bus_type),
+            ("Media", snapshot.media_type),
+        ]
+        parsed = snapshot.smart_parsed or {}
+        is_nvme = is_nvme_drive(snapshot.bus_type, snapshot.media_type, snapshot.model, snapshot.raw_smart_preview)
+        is_ssd = is_ssd_drive(snapshot.bus_type, snapshot.media_type, snapshot.model, snapshot.raw_smart_preview)
+        is_hdd = is_hdd_drive(snapshot.bus_type, snapshot.media_type, snapshot.model, snapshot.raw_smart_preview, snapshot.drive_type)
+        is_usb = is_usb_bridge_device(snapshot.bus_type, snapshot.media_type, snapshot.model, snapshot.raw_smart_preview, snapshot.drive_type, snapshot.smart_status)
+        if is_nvme or is_ssd:
+            return base + [
+                ("Temp", snapshot.temperature),
+                ("Wear", snapshot.wear),
+                ("Media Errors", str(snapshot.nvme_media_errors)),
+                ("Power Hours", snapshot.power_on_hours),
+                ("Spare", f"{safe_int(parsed.get('nvme_available_spare'), 0)}%" if safe_int(parsed.get("nvme_available_spare"), 0) else "Not Reported"),
+                ("Data Written", str(parsed.get("nvme_data_units_written", "Not Reported"))),
+            ]
+        if is_hdd:
+            return base + [
+                ("Reallocated", str(snapshot.reallocated)),
+                ("Pending", str(snapshot.pending)),
+                ("Uncorrectable", str(snapshot.uncorrectable)),
+                ("CRC", str(snapshot.crc_errors)),
+                ("Spin Retry", str(parsed.get("spin_retry_count", "Not Reported"))),
+                ("Power Hours", snapshot.power_on_hours),
+            ]
+        if is_usb:
+            return base + [
+                ("SMART", snapshot.smart_status or "SMART Unavailable"),
+                ("Temp", snapshot.temperature),
+                ("Wear", snapshot.wear),
+                ("Controller", "Visible" if snapshot.smart_parsed else "Not Exposed"),
+                ("Capacity", f"{human_bytes(snapshot.free)} free"),
+                ("CRC", str(snapshot.crc_errors)),
+            ]
+        return base + [
+            ("SMART", snapshot.smart_status or "SMART Unavailable"),
+            ("Temp", snapshot.temperature),
+            ("Wear", snapshot.wear),
+            ("Power Hours", snapshot.power_on_hours),
+            ("Pending", str(snapshot.pending)),
+            ("CRC", str(snapshot.crc_errors)),
+        ]
+
+    def create_drive_health_card(self, parent, snapshot: DriveHealthSnapshot):
+        selected = snapshot.root == self.selected_drive_health_root
+        accent = health_status_color(snapshot.health_status)
+        border = CYBER_CYAN if selected else accent
+        frame = tk.Frame(parent, bg=CYBER_PANEL, highlightbackground=border, highlightcolor=CYBER_CYAN, highlightthickness=2 if selected else 1, padx=12, pady=10)
+        frame.configure(height=300)
+        frame.grid_columnconfigure(0, weight=1)
+        header = tk.Frame(frame, bg=CYBER_PANEL)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        title = f"{snapshot.drive_letter} {snapshot.model}"
+        tk.Label(header, text=title, bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Consolas", 12, "bold"), wraplength=360, justify="left").grid(row=0, column=0, sticky="w")
+        tk.Label(header, text=snapshot.health_status, bg=accent, fg="#FFFFFF", font=("Consolas", 9, "bold"), padx=8, pady=3).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        tk.Label(frame, text=f"{snapshot.display_name}", bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 9), wraplength=460, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 8))
+
+        score_shell = tk.Frame(frame, bg=CYBER_PANEL)
+        score_shell.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        score_shell.grid_columnconfigure(1, weight=1)
+        tk.Label(score_shell, text=f"{snapshot.health_score}/100", bg=CYBER_PANEL, fg=accent, font=("Consolas", 18, "bold")).grid(row=0, column=0, sticky="w")
+        bar = tk.Canvas(score_shell, height=12, bg=CYBER_PANEL, highlightthickness=0)
+        bar.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        bar.bind("<Configure>", lambda e, s=snapshot, c=bar, a=accent: self.draw_health_score_bar(c, s.health_score, a))
+
+        grid = tk.Frame(frame, bg=CYBER_PANEL)
+        grid.grid(row=3, column=0, sticky="ew")
+        for i in range(2):
+            grid.grid_columnconfigure(i, weight=1)
+        stats = self.drive_health_card_stats(snapshot)
+        for idx, (label, value) in enumerate(stats):
+            cell = tk.Frame(grid, bg=CYBER_PANEL_2, highlightbackground=CYBER_BORDER, highlightthickness=1, padx=7, pady=5)
+            cell.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=3, pady=3)
+            tk.Label(cell, text=label.upper(), bg=CYBER_PANEL_2, fg=CYBER_MUTED, font=("Segoe UI", 7, "bold")).pack(anchor="w")
+            tk.Label(cell, text=value or "Unknown", bg=CYBER_PANEL_2, fg=CYBER_TEXT, font=("Consolas", 9, "bold"), wraplength=180, justify="left").pack(anchor="w")
+
+        footer = tk.Frame(frame, bg=CYBER_PANEL)
+        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        footer.grid_columnconfigure(0, weight=1)
+        tk.Label(footer, text=snapshot.recommendation, bg=CYBER_PANEL, fg=accent, font=("Segoe UI", 9, "bold"), wraplength=320, justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="View Full Details", style="Cyber.TButton", command=lambda r=snapshot.root: self.open_drive_full_details(r)).grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        def select(_event=None, root=snapshot.root):
+            self.select_drive_health_card(root)
+            return "break"
+
+        for widget in (frame, header, score_shell, grid, footer):
+            widget.bind("<Button-1>", select, add="+")
+            self.bind_mousewheel(widget, self.drive_health_canvas)
+        self.bind_mousewheel_recursive(frame, self.drive_health_canvas)
+        return frame
+
+    def draw_health_score_bar(self, canvas, score, color):
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        canvas.create_rectangle(0, 0, width, height, outline=CYBER_BORDER, fill="#07101D")
+        fill = width * max(0, min(100, int(score))) / 100
+        canvas.create_rectangle(0, 0, fill, height, outline=color, fill=color)
+
+    def select_drive_health_card(self, root):
+        self.selected_drive_health_root = root
+        self.render_drive_health_cards()
+        self.update_drive_health_details()
+
+    def open_drive_full_details(self, root):
+        self.select_drive_health_card(root)
+        snapshot = self.selected_drive_health_snapshot()
+        if not snapshot:
+            messagebox.showinfo("Drive Details", "No drive health snapshot is available for this device.")
+            return
+        existing = self.drive_detail_windows.get(root)
+        if existing and existing.get("window") and existing["window"].winfo_exists():
+            existing["window"].lift()
+            existing["window"].focus_force()
+            self.populate_drive_detail_window(root)
+            return
+        win = tk.Toplevel(self)
+        win.title(f"{APP_NAME} - Full Drive Diagnostics")
+        win.configure(bg=CYBER_BG)
+        win.geometry("1200x800")
+        win.minsize(980, 680)
+        try:
+            icon_path = Path(APP_ICON_PATH)
+            if icon_path.is_file():
+                win.iconbitmap(str(icon_path))
+        except Exception:
+            pass
+        self.center_toplevel(win, 1200, 800)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        header = self.make_panel(win)
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        header.grid_columnconfigure(0, weight=1)
+        title_var = tk.StringVar(value="")
+        subtitle_var = tk.StringVar(value="")
+        tk.Label(header, textvariable=title_var, bg=CYBER_PANEL, fg=CYBER_CYAN, font=("Consolas", 16, "bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        tk.Label(header, textvariable=subtitle_var, bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Segoe UI", 10), wraplength=860, justify="left").grid(row=1, column=0, sticky="w", padx=14, pady=(0, 12))
+        action_frame = tk.Frame(header, bg=CYBER_PANEL)
+        action_frame.grid(row=0, column=1, rowspan=2, sticky="e", padx=12, pady=10)
+        notebook = ttk.Notebook(win, style="Cyber.TNotebook")
+        notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        state = {
+            "window": win,
+            "title_var": title_var,
+            "subtitle_var": subtitle_var,
+            "notebook": notebook,
+            "tabs": {},
+            "widgets": {},
+            "action_frame": action_frame,
+        }
+        self.drive_detail_windows[root] = state
+        win.protocol("WM_DELETE_WINDOW", lambda r=root: self.close_drive_detail_window(r))
+        self.build_drive_detail_tabs(root)
+        self.populate_drive_detail_window(root)
+
+    def center_toplevel(self, win, width, height):
+        try:
+            self.update_idletasks()
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
+
+    def close_drive_detail_window(self, root):
+        state = self.drive_detail_windows.pop(root, None)
+        if state and state.get("window") and state["window"].winfo_exists():
+            state["window"].destroy()
+
+    def refresh_open_drive_detail_windows(self):
+        stale = []
+        for root, state in list(getattr(self, "drive_detail_windows", {}).items()):
+            if not state.get("window") or not state["window"].winfo_exists():
+                stale.append(root)
+                continue
+            self.populate_drive_detail_window(root)
+        for root in stale:
+            self.drive_detail_windows.pop(root, None)
+
+    def build_drive_detail_tabs(self, root):
+        state = self.drive_detail_windows[root]
+        nb = state["notebook"]
+        for name in ("Overview", "SMART Details", "Health Analysis", "Surface Stability", "Raw SMART Output", "History / Timeline"):
+            frame = tk.Frame(nb, bg=CYBER_BG)
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(0, weight=1)
+            nb.add(frame, text=name)
+            state["tabs"][name] = frame
+        state["widgets"]["overview"] = self.create_scrollable_detail_tab(state["tabs"]["Overview"])
+        state["widgets"]["smart"] = self.create_scrollable_detail_tab(state["tabs"]["SMART Details"])
+        state["widgets"]["analysis"] = self.create_scrollable_detail_tab(state["tabs"]["Health Analysis"])
+        state["widgets"]["surface"] = self.create_scrollable_detail_tab(state["tabs"]["Surface Stability"])
+        raw_panel = self.make_panel(state["tabs"]["Raw SMART Output"])
+        raw_panel.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        raw_panel.grid_columnconfigure(0, weight=1)
+        raw_panel.grid_rowconfigure(2, weight=1)
+        raw_tools = tk.Frame(raw_panel, bg=CYBER_PANEL)
+        raw_tools.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        raw_tools.grid_columnconfigure(2, weight=1)
+        search_var = tk.StringVar()
+        tk.Label(raw_tools, text="SEARCH", bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 8, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        search_entry = self.neon_entry(raw_tools, search_var)
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(raw_tools, text="Find", style="Cyber.TButton", command=lambda r=root: self.search_raw_smart_output(r)).grid(row=0, column=2, sticky="w", padx=4)
+        ttk.Button(raw_tools, text="Copy to Clipboard", style="Cyber.TButton", command=lambda r=root: self.copy_raw_smart_output(r)).grid(row=0, column=3, sticky="e", padx=4)
+        ttk.Button(raw_tools, text="Save Raw Output", style="Cyber.TButton", command=lambda r=root: self.save_raw_smart_output(r)).grid(row=0, column=4, sticky="e", padx=4)
+        raw_text = self.make_text(raw_panel, height=28)
+        raw_text.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        state["widgets"]["raw_search_var"] = search_var
+        state["widgets"]["raw_text"] = raw_text
+        state["widgets"]["history"] = self.create_scrollable_detail_tab(state["tabs"]["History / Timeline"])
+
+    def create_scrollable_detail_tab(self, parent):
+        canvas = tk.Canvas(parent, bg=CYBER_BG, highlightthickness=0, bd=0)
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview, style="Cyber.Vertical.TScrollbar")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        frame = tk.Frame(canvas, bg=CYBER_BG)
+        window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _event, c=canvas: c.configure(scrollregion=c.bbox("all")))
+        canvas.bind("<Configure>", lambda event, c=canvas, w=window: c.itemconfigure(w, width=max(1, event.width)))
+        self.bind_mousewheel(canvas, canvas)
+        self.bind_mousewheel(frame, canvas)
+        return {"canvas": canvas, "frame": frame}
+
+    def clear_frame(self, frame):
+        for child in frame.winfo_children():
+            child.destroy()
+
+    def detail_panel(self, parent, title, accent=CYBER_CYAN):
+        panel = tk.Frame(parent, bg=CYBER_PANEL, highlightbackground=accent, highlightthickness=1, padx=14, pady=12)
+        panel.grid_columnconfigure(0, weight=1)
+        tk.Label(panel, text=title, bg=CYBER_PANEL, fg=accent, font=("Consolas", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        return panel
+
+    def populate_drive_detail_window(self, root):
+        state = self.drive_detail_windows.get(root)
+        if not state or not state.get("window") or not state["window"].winfo_exists():
+            return
+        snapshot = next((item for item in self.drive_health_snapshots if item.root == root), None)
+        if not snapshot:
+            snapshot = self.selected_drive_health_snapshot()
+        if not snapshot:
+            return
+        state["title_var"].set(f"{snapshot.drive_letter} {snapshot.model} - Full Drive Diagnostics")
+        state["subtitle_var"].set(f"{snapshot.display_name} | {snapshot.recommendation} | Last checked {snapshot.last_checked}")
+        self.populate_drive_detail_actions(root, snapshot)
+        self.populate_detail_overview(root, snapshot)
+        self.populate_detail_smart(root, snapshot)
+        self.populate_detail_analysis(root, snapshot)
+        self.populate_detail_surface(root, snapshot)
+        self.populate_detail_raw(root, snapshot)
+        self.populate_detail_history(root, snapshot)
+
+    def populate_drive_detail_actions(self, root, snapshot):
+        state = self.drive_detail_windows[root]
+        frame = state["action_frame"]
+        for child in frame.winfo_children():
+            child.destroy()
+        buttons = [
+            ("Refresh Diagnostics", lambda: self.rescan_drive_from_detail(root)),
+            ("Re-run SMART Analysis", lambda: self.run_detail_health_task(root, "SMART Health Analyzer", lambda runner: runner.run_smart_check())),
+            ("Re-run Windows Health", lambda: self.run_detail_health_task(root, "Windows Health Analyzer", lambda runner: runner.run_windows_health_check())),
+            ("Read-Only CHKDSK", lambda: self.run_detail_health_task(root, "Read-Only CHKDSK Preview", lambda runner: runner.run_read_only_chkdsk())),
+            ("Surface Stability Scan", lambda: self.run_detail_surface_scan(root)),
+            ("Copy Device Summary", lambda: self.copy_device_summary(snapshot)),
+            ("Export TXT", lambda: self.export_single_drive_health_report(snapshot, "txt")),
+            ("Export JSON", lambda: self.export_single_drive_health_report(snapshot, "json")),
+            ("Export HTML", lambda: self.export_single_drive_health_report(snapshot, "html")),
+            ("Export PDF", lambda: self.export_single_drive_health_report(snapshot, "pdf")),
+        ]
+        for col in range(5):
+            frame.grid_columnconfigure(col, weight=1, minsize=145)
+        for idx, (label, command) in enumerate(buttons):
+            ttk.Button(frame, text=label, style="Cyber.TButton", command=command).grid(row=idx // 5, column=idx % 5, sticky="ew", padx=4, pady=4)
+
+    def populate_detail_overview(self, root, snapshot):
+        frame = self.drive_detail_windows[root]["widgets"]["overview"]["frame"]
+        self.clear_frame(frame)
+        frame.grid_columnconfigure(0, weight=1)
+        accent = health_status_color(snapshot.health_status)
+        badge = self.detail_panel(frame, "HEALTH OVERVIEW", accent)
+        badge.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        badge.grid_columnconfigure(1, weight=1)
+        tk.Label(badge, text=snapshot.health_status, bg=accent, fg="#FFFFFF", font=("Consolas", 22, "bold"), padx=18, pady=10).grid(row=1, column=0, sticky="w", padx=(0, 14))
+        tk.Label(badge, text=f"Health Score: {snapshot.health_score}/100\n{snapshot.recommendation}", bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Consolas", 13, "bold"), justify="left").grid(row=1, column=1, sticky="w")
+        score_bar = tk.Canvas(badge, height=18, bg=CYBER_PANEL, highlightthickness=0)
+        score_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+        score_bar.bind("<Configure>", lambda _e, c=score_bar, s=snapshot, a=accent: self.draw_health_score_bar(c, s.health_score, a))
+        cap_bar = tk.Canvas(badge, height=18, bg=CYBER_PANEL, highlightthickness=0)
+        cap_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        cap_bar.bind("<Configure>", lambda _e, c=cap_bar, s=snapshot: self.draw_capacity_bar(c, s))
+        tk.Label(badge, text=f"Temperature: {snapshot.temperature}", bg=CYBER_PANEL, fg=CYBER_YELLOW, font=("Consolas", 12, "bold")).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        identity = self.detail_panel(frame, "DRIVE IDENTITY", CYBER_CYAN)
+        identity.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        items = [
+            ("Drive Letter", snapshot.drive_letter),
+            ("Root Path", snapshot.root),
+            ("Volume Label", snapshot.volume_label),
+            ("Model", snapshot.model),
+            ("Manufacturer", snapshot.manufacturer),
+            ("Serial Number", snapshot.serial),
+            ("Firmware Version", snapshot.firmware),
+            ("Capacity", human_bytes(snapshot.capacity)),
+            ("Free Space", human_bytes(snapshot.free)),
+            ("Used Space", human_bytes(snapshot.used)),
+            ("File System", snapshot.filesystem),
+            ("Bus Type", snapshot.bus_type),
+            ("Media Type", snapshot.media_type),
+            ("SMART Status", snapshot.smart_status),
+            ("Windows Health", snapshot.windows_status),
+            ("Last Checked", snapshot.last_checked),
+        ]
+        self.add_key_value_grid(identity, items, start_row=1)
+
+    def draw_capacity_bar(self, canvas, snapshot):
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        used_ratio = snapshot.used / max(1, snapshot.capacity)
+        canvas.create_rectangle(0, 0, width, height, outline=CYBER_BORDER, fill="#07101D")
+        canvas.create_rectangle(0, 0, width * used_ratio, height, outline=CYBER_BLUE, fill=CYBER_BLUE)
+        canvas.create_text(8, height / 2, anchor="w", fill="#FFFFFF", font=("Consolas", 9, "bold"), text=f"Capacity used {used_ratio * 100:.1f}%")
+
+    def add_key_value_grid(self, parent, items, start_row=0):
+        for col in range(2):
+            parent.grid_columnconfigure(col, weight=1)
+        for idx, (label, value) in enumerate(items):
+            cell = tk.Frame(parent, bg=CYBER_PANEL_2, highlightbackground=CYBER_BORDER, highlightthickness=1, padx=9, pady=7)
+            cell.grid(row=start_row + idx // 2, column=idx % 2, sticky="ew", padx=4, pady=4)
+            tk.Label(cell, text=label.upper(), bg=CYBER_PANEL_2, fg=CYBER_MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+            tk.Label(cell, text=str(value or "Not Reported"), bg=CYBER_PANEL_2, fg=CYBER_TEXT, font=("Consolas", 10, "bold"), wraplength=430, justify="left").pack(anchor="w", pady=(2, 0))
+
+    def smart_attribute_rows(self, snapshot):
+        parsed = snapshot.smart_parsed or {}
+        raw_map = {
+            "Reallocated_Sector_Ct": ("reallocated_sector_count", snapshot.reallocated, 0, 10),
+            "Current_Pending_Sector": ("current_pending_sector_count", snapshot.pending, 0, 1),
+            "Offline_Uncorrectable": ("offline_uncorrectable", snapshot.uncorrectable, 0, 1),
+            "UDMA_CRC_Error_Count": ("udma_crc_error_count", snapshot.crc_errors, 0, 10),
+            "Power_On_Hours": ("power_on_hours", snapshot.power_on_hours, None, None),
+            "Power_Cycle_Count": ("power_cycle_count", snapshot.power_cycle_count, None, None),
+            "Temperature_Celsius": ("temperature_celsius", snapshot.temperature, 50, 60),
+            "Percentage Used": ("percentage_used", parsed.get("percentage_used", "Not Reported"), 70, 90),
+            "Available Spare": ("nvme_available_spare", parsed.get("nvme_available_spare", "Not Reported"), 30, 10),
+            "Unsafe Shutdowns": ("unsafe_shutdowns", parsed.get("unsafe_shutdowns", "Not Reported"), 1, 20),
+            "Media and Data Integrity Errors": ("nvme_media_data_integrity_errors", snapshot.nvme_media_errors, 0, 1),
+            "Spin_Retry_Count": ("spin_retry_count", parsed.get("spin_retry_count", "Not Reported"), 0, 1),
+            "Seek_Error_Rate": ("seek_error_rate", parsed.get("seek_error_rate", "Not Reported"), None, None),
+            "Start_Stop_Count": ("start_stop_count", parsed.get("start_stop_count", "Not Reported"), None, None),
+            "Load_Cycle_Count": ("load_cycle_count", parsed.get("load_cycle_count", "Not Reported"), None, None),
+        }
+        rows = []
+        for attr, (key, value, warn, critical) in raw_map.items():
+            raw_value = parsed.get(key, value)
+            numeric = safe_int(raw_value, -1)
+            status = "Healthy"
+            color = CYBER_GREEN
+            if attr == "Available Spare" and numeric >= 0:
+                if numeric <= critical:
+                    status, color = "Critical", CYBER_RED
+                elif numeric <= warn:
+                    status, color = "Warning", CYBER_ORANGE
+            elif numeric >= 0 and warn is not None and critical is not None:
+                if numeric >= critical:
+                    status, color = "Critical", CYBER_RED
+                elif numeric > warn:
+                    status, color = "Warning", CYBER_ORANGE
+            elif raw_value == "Not Reported":
+                status, color = "Not Reported", CYBER_MUTED
+            rows.append(
+                {
+                    "attribute": attr,
+                    "current": parsed.get(f"{key}_current", "N/A"),
+                    "worst": parsed.get(f"{key}_worst", "N/A"),
+                    "threshold": parsed.get(f"{key}_threshold", "N/A"),
+                    "raw": raw_value,
+                    "status": status,
+                    "color": color,
+                }
+            )
+        return rows
+
+    def populate_detail_smart(self, root, snapshot):
+        frame = self.drive_detail_windows[root]["widgets"]["smart"]["frame"]
+        self.clear_frame(frame)
+        panel = self.detail_panel(frame, "SMART ATTRIBUTE TABLE", CYBER_CYAN)
+        panel.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        headers = ("Attribute", "Current", "Worst", "Threshold", "Raw Value", "Status")
+        for col, header in enumerate(headers):
+            panel.grid_columnconfigure(col, weight=1 if col in (0, 4) else 0)
+            tk.Label(panel, text=header.upper(), bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 8, "bold")).grid(row=1, column=col, sticky="ew", padx=4, pady=4)
+        rows = self.smart_attribute_rows(snapshot)
+        if not rows:
+            tk.Label(panel, text="SMART attributes are not available for this device.", bg=CYBER_PANEL, fg=CYBER_MUTED).grid(row=2, column=0, columnspan=6, sticky="w", padx=4, pady=8)
+            return
+        for ridx, row in enumerate(rows, start=2):
+            values = (row["attribute"], row["current"], row["worst"], row["threshold"], row["raw"], row["status"])
+            for col, value in enumerate(values):
+                fg = row["color"] if col == 5 else CYBER_TEXT
+                tk.Label(panel, text=str(value), bg=CYBER_PANEL_2, fg=fg, font=("Consolas", 9, "bold" if col in (0, 5) else "normal"), anchor="w", padx=7, pady=5, wraplength=260).grid(row=ridx, column=col, sticky="ew", padx=2, pady=2)
+
+    def populate_detail_analysis(self, root, snapshot):
+        frame = self.drive_detail_windows[root]["widgets"]["analysis"]["frame"]
+        self.clear_frame(frame)
+        summary = self.detail_panel(frame, "HEALTH SCORE BREAKDOWN", health_status_color(snapshot.health_status))
+        summary.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        tk.Label(summary, text=f"Health Score: {snapshot.health_score}/100", bg=CYBER_PANEL, fg=health_status_color(snapshot.health_status), font=("Consolas", 20, "bold")).grid(row=1, column=0, sticky="w")
+        tk.Label(summary, text=f"Recommendation: {snapshot.recommendation}", bg=CYBER_PANEL, fg=CYBER_TEXT, font=("Segoe UI", 11, "bold"), wraplength=980, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        issues_panel = self.detail_panel(frame, "TRIGGERED ISSUES / RISK FACTORS", CYBER_YELLOW)
+        issues_panel.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        issues = snapshot.issues or []
+        if not issues:
+            tk.Label(issues_panel, text="No health-specific findings recorded.", bg=CYBER_PANEL, fg=CYBER_GREEN, font=("Consolas", 11, "bold")).grid(row=1, column=0, sticky="w")
+        for idx, issue in enumerate(issues, start=1):
+            severity = issue.get("severity", "Info")
+            color = CYBER_RED if severity in ("Critical", "High") else CYBER_ORANGE if severity in ("Warning", "Medium") else CYBER_CYAN
+            card = tk.Frame(issues_panel, bg=CYBER_PANEL_2, highlightbackground=color, highlightthickness=1, padx=10, pady=8)
+            card.grid(row=idx, column=0, sticky="ew", pady=5)
+            card.grid_columnconfigure(0, weight=1)
+            tk.Label(card, text=f"{severity}: {issue.get('title', 'Finding')}", bg=CYBER_PANEL_2, fg=color, font=("Consolas", 11, "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(card, text=issue.get("detail", ""), bg=CYBER_PANEL_2, fg=CYBER_TEXT, font=("Segoe UI", 10), wraplength=980, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        diag = self.detail_panel(frame, "DIAGNOSTIC SUMMARY", CYBER_CYAN)
+        diag.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        self.add_key_value_grid(
+            diag,
+            [
+                ("SMART Status", snapshot.smart_status),
+                ("Windows Health", snapshot.windows_status),
+                ("Temperature", snapshot.temperature),
+                ("Wear", snapshot.wear),
+                ("Reallocated", snapshot.reallocated),
+                ("Pending", snapshot.pending),
+                ("Uncorrectable", snapshot.uncorrectable),
+                ("CRC Errors", snapshot.crc_errors),
+            ],
+            start_row=1,
+        )
+
+    def latest_surface_result_for_root(self, root):
+        result = getattr(self, "last_health_result", None)
+        if result and normalize_drive_root(result.target).lower() == normalize_drive_root(root).lower() and result.surface_results:
+            return result.surface_results
+        return {}
+
+    def populate_detail_surface(self, root, snapshot):
+        frame = self.drive_detail_windows[root]["widgets"]["surface"]["frame"]
+        self.clear_frame(frame)
+        surface = self.latest_surface_result_for_root(root)
+        panel = self.detail_panel(frame, "SURFACE READ STABILITY", CYBER_CYAN)
+        panel.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        if not surface:
+            tk.Label(panel, text="No surface read stability analysis has been performed.", bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w")
+            return
+        self.add_key_value_grid(
+            panel,
+            [
+                ("Status", surface.get("status", "Unknown")),
+                ("Average Read Speed", f"{surface.get('average_mb_s', 'Unknown')} MB/s"),
+                ("Sampled Bytes", surface.get("sampled_human", human_bytes(surface.get("sampled_bytes", 0)))),
+                ("Files Seen", surface.get("files_seen", "Unknown")),
+                ("Inaccessible Files", surface.get("inaccessible_files", "Unknown")),
+                ("Recommendation", surface.get("recommendation", "N/A")),
+            ],
+            start_row=1,
+        )
+        log_panel = self.detail_panel(frame, "SLOW REGIONS / READ FAILURES", CYBER_YELLOW)
+        log_panel.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        text = self.make_text(log_panel, height=16)
+        text.grid(row=1, column=0, sticky="nsew")
+        self.set_text(text, json.dumps({"slow_samples": surface.get("slow_samples", []), "read_failures": surface.get("read_failures", [])}, indent=2))
+
+    def populate_detail_raw(self, root, snapshot):
+        raw_text = self.drive_detail_windows[root]["widgets"]["raw_text"]
+        self.set_text(raw_text, snapshot.raw_smart_preview or "No raw SMART output available for this device.")
+
+    def populate_detail_history(self, root, snapshot):
+        frame = self.drive_detail_windows[root]["widgets"]["history"]["frame"]
+        self.clear_frame(frame)
+        panel = self.detail_panel(frame, "HEALTH HISTORY / TIMELINE", CYBER_CYAN)
+        panel.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        entries = []
+        try:
+            target_root = normalize_drive_root(root).lower()
+            for item in load_health_history():
+                target = str(item.get("target", ""))
+                if target and (target.lower() == root.lower() or normalize_drive_root(target).lower() == target_root or target == "All detected drives"):
+                    entries.append(item)
+        except Exception:
+            entries = []
+        if not entries:
+            tk.Label(panel, text="No historical diagnostics available.", bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w")
+            return
+        headers = ("Time", "Status", "Risk", "Recommendation", "Report")
+        for col, header in enumerate(headers):
+            panel.grid_columnconfigure(col, weight=1)
+            tk.Label(panel, text=header.upper(), bg=CYBER_PANEL, fg=CYBER_MUTED, font=("Segoe UI", 8, "bold")).grid(row=1, column=col, sticky="ew", padx=3, pady=3)
+        for ridx, item in enumerate(entries[:80], start=2):
+            values = (item.get("completed_at"), item.get("health_status"), item.get("health_risk_score"), item.get("recommendation"), item.get("report_html") or item.get("report_txt") or "")
+            for col, value in enumerate(values):
+                tk.Label(panel, text=str(value or "N/A"), bg=CYBER_PANEL_2, fg=CYBER_TEXT, font=("Consolas", 9), anchor="w", wraplength=280, padx=6, pady=5).grid(row=ridx, column=col, sticky="ew", padx=2, pady=2)
+
+    def device_summary_text(self, snapshot: DriveHealthSnapshot):
+        return "\n".join(
+            [
+                f"{snapshot.model} ({snapshot.drive_letter})",
+                f"{snapshot.bus_type} {snapshot.media_type}".strip(),
+                f"Root: {snapshot.root}",
+                f"Capacity: {human_bytes(snapshot.capacity)}",
+                f"Health Score: {snapshot.health_score}/100",
+                f"SMART Status: {snapshot.smart_status}",
+                f"Windows Health: {snapshot.windows_status}",
+                f"Temperature: {snapshot.temperature}",
+                f"Wear: {snapshot.wear}",
+                f"Recommendation: {snapshot.recommendation}",
+            ]
+        )
+
+    def copy_device_summary(self, snapshot):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.device_summary_text(snapshot))
+            self.health_status_var.set("Device summary copied to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("Copy Failed", str(exc))
+
+    def copy_raw_smart_output(self, root):
+        snapshot = next((item for item in self.drive_health_snapshots if item.root == root), None)
+        text = snapshot.raw_smart_preview if snapshot else ""
+        if not text:
+            text = "No raw SMART output available."
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except Exception as exc:
+            messagebox.showerror("Copy Failed", str(exc))
+
+    def save_raw_smart_output(self, root):
+        snapshot = next((item for item in self.drive_health_snapshots if item.root == root), None)
+        text = snapshot.raw_smart_preview if snapshot else ""
+        if not text:
+            messagebox.showinfo("Raw SMART Output", "No raw SMART output is available for this device.")
+            return
+        reports_dir = ensure_reports_dir()
+        clean = (snapshot.drive_letter or snapshot.root or "drive").replace("\\", "_").replace("/", "_").replace(":", "")
+        path = reports_dir / f"raw_smart_{clean}_{file_stamp()}.txt"
+        path.write_text(text, encoding="utf-8")
+        self.open_file(str(path))
+
+    def search_raw_smart_output(self, root):
+        state = self.drive_detail_windows.get(root)
+        if not state:
+            return
+        text_frame = state["widgets"].get("raw_text")
+        query = state["widgets"].get("raw_search_var").get().strip()
+        if not text_frame or not query:
+            return
+        text = self.text_widget(text_frame)
+        text.configure(state="normal")
+        text.tag_remove("raw_search", "1.0", tk.END)
+        pos = text.search(query, "1.0", nocase=True, stopindex=tk.END)
+        if pos:
+            end = f"{pos}+{len(query)}c"
+            text.tag_add("raw_search", pos, end)
+            text.tag_config("raw_search", background=CYBER_YELLOW, foreground="#031019")
+            text.see(pos)
+        text.configure(state="disabled")
+
+    def export_single_drive_health_report(self, snapshot, fmt):
+        reports_dir = ensure_reports_dir()
+        clean = (snapshot.drive_letter or snapshot.root or "drive").replace("\\", "_").replace("/", "_").replace(":", "")
+        base = reports_dir / f"storage_health_{clean}_{file_stamp()}"
+        fmt = fmt.lower()
+        try:
+            if fmt == "txt":
+                path = base.with_suffix(".txt")
+                path.write_text(self.drive_health_report_text([snapshot]), encoding="utf-8")
+            elif fmt == "json":
+                path = base.with_suffix(".json")
+                path.write_text(json.dumps({"generated_at": now_stamp(), "drive_snapshot": asdict(snapshot)}, indent=2), encoding="utf-8")
+            elif fmt == "html":
+                path = base.with_suffix(".html")
+                path.write_text(self.drive_health_html_report([snapshot]), encoding="utf-8")
+            elif fmt == "pdf":
+                html_content = self.drive_health_html_report([snapshot])
+                path = base.with_suffix(".pdf")
+                try:
+                    from weasyprint import HTML
+                    HTML(string=html_content, base_url=str(reports_dir)).write_pdf(str(path))
+                except Exception as exc:
+                    logging.info("Single-drive PDF export unavailable: %s", exc)
+                    html_path = base.with_suffix(".html")
+                    html_path.write_text(html_content, encoding="utf-8")
+                    messagebox.showinfo("PDF Export", "PDF engine is unavailable. HTML report was generated instead.")
+                    path = html_path
+            else:
+                return
+            append_health_history(
+                {
+                    "completed_at": now_stamp(),
+                    "target": snapshot.root,
+                    "health_status": snapshot.health_status,
+                    "health_risk_score": 100 - snapshot.health_score,
+                    "recommendation": snapshot.recommendation,
+                    "smart_status": snapshot.smart_status,
+                    "windows_health_status": snapshot.windows_status,
+                    "read_stability_status": "Not run",
+                    "report_html": str(path) if path.suffix.lower() == ".html" else "",
+                    "report_txt": str(path) if path.suffix.lower() == ".txt" else "",
+                }
+            )
+            self.open_file(str(path))
+        except Exception as exc:
+            messagebox.showerror("Export Failed", str(exc))
+
+    def run_health_task_for_target(self, task_name, target, action):
+        if self.health_thread and self.health_thread.is_alive():
+            messagebox.showinfo("Diagnostics Running", "A health diagnostic task is already running.")
+            return
+        self.health_status_var.set(f"{task_name} running for {target}...")
+        self.health_progress_var.set(0)
+        self.append_text(self.health_output_text, f"\n[{now_stamp()}] {task_name} started for {target}\n")
+        self.health_runner = StorageHealthDiagnostics(target, self.health_log_callback, self.health_status_callback, self.health_progress_callback)
+
+        def worker():
+            try:
+                action(self.health_runner)
+                result = self.health_runner.finalize()
+                self.health_queue.put({"type": "complete", "result": result})
+            except Exception as exc:
+                self.health_queue.put({"type": "log", "message": f"[Health/Critical] {type(exc).__name__}: {exc}"})
+                logging.exception("Health diagnostic task failed")
+
+        self.health_thread = threading.Thread(target=worker, daemon=True)
+        self.health_thread.start()
+
+    def run_detail_health_task(self, root, task_name, action):
+        self.selected_drive_health_root = root
+        self.run_health_task_for_target(task_name, root, action)
+
+    def run_detail_surface_scan(self, root):
+        if not messagebox.askyesno("Read-Only Surface Scan", "This scan reads existing files only and does not repair or write data. Continue?"):
+            return
+        self.apply_settings()
+        self.run_detail_health_task(
+            root,
+            "Surface Read Stability Scan",
+            lambda runner: runner.run_surface_read_stability_scan(
+                max_bytes=self.settings.surface_scan_max_mb * 1024 * 1024,
+                chunk_size=self.settings.surface_scan_chunk_mb * 1024 * 1024,
+                max_seconds=self.settings.surface_scan_max_seconds,
+            ),
+        )
+
+    def rescan_drive_from_detail(self, root):
+        self.selected_drive_health_root = root
+        self.rescan_selected_drive_health()
+
+    def selected_drive_health_snapshot(self):
+        for snapshot in self.drive_health_snapshots:
+            if snapshot.root == self.selected_drive_health_root:
+                return snapshot
+        return self.drive_health_snapshots[0] if self.drive_health_snapshots else None
+
+    def update_drive_health_details(self):
+        if not hasattr(self, "drive_health_details_text"):
+            return
+        snapshot = self.selected_drive_health_snapshot()
+        if not snapshot:
+            self.set_text(self.drive_health_details_text, "No drive selected.\n")
+            return
+        self.set_text(self.drive_health_details_text, self.drive_health_details_text_for(snapshot))
+
+    def drive_health_details_text_for(self, snapshot: DriveHealthSnapshot):
+        issues = "\n".join(f"- [{i.get('severity')}] {i.get('title')}: {i.get('detail')}" for i in snapshot.issues) or "- No health-specific findings recorded."
+        lines = [
+            "IDENTITY",
+            "-" * 78,
+            f"Root: {snapshot.root}",
+            f"Drive Letter: {snapshot.drive_letter}",
+            f"Volume Label: {snapshot.volume_label}",
+            f"Model / Friendly Name: {snapshot.model}",
+            f"Manufacturer: {snapshot.manufacturer}",
+            f"Serial Number: {snapshot.serial}",
+            f"Firmware: {snapshot.firmware}",
+            f"Last Checked: {snapshot.last_checked}",
+            "",
+            "VOLUME DETAILS",
+            "-" * 78,
+            f"Capacity: {human_bytes(snapshot.capacity)}",
+            f"Used: {human_bytes(snapshot.used)}",
+            f"Free: {human_bytes(snapshot.free)}",
+            f"File System: {snapshot.filesystem}",
+            f"Drive Type: {snapshot.drive_type}",
+            f"Bus / Interface: {snapshot.bus_type}",
+            f"Media Type: {snapshot.media_type}",
+            "",
+            "HEALTH SUMMARY",
+            "-" * 78,
+            f"Health Status: {snapshot.health_status}",
+            f"Health Score: {snapshot.health_score}/100",
+            f"Recommendation: {snapshot.recommendation}",
+            f"Windows Health: {snapshot.windows_status}",
+            f"SMART Health: {snapshot.smart_status}",
+            f"SMART Device: {snapshot.smart_device or 'Not matched'}",
+            f"SMART Match: {snapshot.smart_match_confidence}",
+            f"SMART Match Reason: {snapshot.smart_match_reason or 'N/A'}",
+            "",
+            "SMART PARSED VALUES",
+            "-" * 78,
+            f"Temperature: {snapshot.temperature}",
+            f"SSD Wear / Percentage Used: {snapshot.wear}",
+            f"Power-On Hours: {snapshot.power_on_hours}",
+            f"Power Cycle Count: {snapshot.power_cycle_count}",
+            f"Reallocated Sectors: {snapshot.reallocated}",
+            f"Current Pending Sectors: {snapshot.pending}",
+            f"Offline Uncorrectable: {snapshot.uncorrectable}",
+            f"UDMA CRC Errors: {snapshot.crc_errors}",
+            f"NVMe Media/Data Integrity Errors: {snapshot.nvme_media_errors}",
+            f"Available Spare: {snapshot.smart_parsed.get('nvme_available_spare', 'Not Reported')}",
+            f"Available Spare Threshold: {snapshot.smart_parsed.get('nvme_available_spare_threshold', 'Not Reported')}",
+            f"Spin Retry Count: {snapshot.smart_parsed.get('spin_retry_count', 'Not Reported')}",
+            f"Seek Error Rate: {snapshot.smart_parsed.get('seek_error_rate', 'Not Reported')}",
+            f"Start/Stop Count: {snapshot.smart_parsed.get('start_stop_count', 'Not Reported')}",
+            f"Load Cycle Count: {snapshot.smart_parsed.get('load_cycle_count', 'Not Reported')}",
+            f"Unsafe Shutdowns: {snapshot.smart_parsed.get('unsafe_shutdowns', 'Not Reported')}",
+            "",
+            "RISK FACTORS",
+            "-" * 78,
+            issues,
+            "",
+            "WINDOWS HEALTH VALUES",
+            "-" * 78,
+            json.dumps(snapshot.windows_parsed, indent=2),
+            "",
+            "RAW SMART OUTPUT PREVIEW",
+            "-" * 78,
+            snapshot.raw_smart_preview or "No raw SMART output available.",
+        ]
+        return "\n".join(lines)
+
+    def run_health_task(self, task_name, action):
+        target = self.selected_health_target()
+        self.run_health_task_for_target(task_name, target, action)
+
+    def refresh_health(self):
+        self.run_health_task("Refresh Health", lambda runner: runner.run_all(include_chkdsk=False, include_surface=False))
+
+    def run_health_smart(self):
+        self.run_health_task("SMART Health Analyzer", lambda runner: runner.run_smart_check())
+
+    def run_health_windows(self):
+        self.run_health_task("Windows Health Analyzer", lambda runner: runner.run_windows_health_check())
+
+    def run_health_chkdsk(self):
+        self.run_health_task("Read-Only CHKDSK Preview", lambda runner: runner.run_read_only_chkdsk())
+
+    def run_health_surface(self):
+        if not messagebox.askyesno("Read-Only Surface Scan", "This scan reads existing files only and does not repair or write data. Continue?"):
+            return
+        self.apply_settings()
+        self.run_health_task(
+            "Surface Read Stability Scan",
+            lambda runner: runner.run_surface_read_stability_scan(
+                max_bytes=self.settings.surface_scan_max_mb * 1024 * 1024,
+                chunk_size=self.settings.surface_scan_chunk_mb * 1024 * 1024,
+                max_seconds=self.settings.surface_scan_max_seconds,
+            ),
+        )
+
+    def cancel_health_diagnostic(self):
+        if self.health_runner and self.health_thread and self.health_thread.is_alive():
+            self.health_runner.cancel()
+            self.health_status_var.set("Cancelling health diagnostic...")
+            self.health_log_callback("Health diagnostic cancellation requested.")
+        else:
+            self.health_status_var.set("No health diagnostic is currently running.")
+
+    def update_health_ui(self, result: HealthDiagnosticResult):
+        global LAST_HEALTH_SUMMARY
+        self.last_health_result = result
+        drive_snapshots = LAST_HEALTH_SUMMARY.get("drive_snapshots", []) if isinstance(LAST_HEALTH_SUMMARY, dict) else []
+        LAST_HEALTH_SUMMARY = asdict(result)
+        if drive_snapshots:
+            LAST_HEALTH_SUMMARY["drive_snapshots"] = drive_snapshots
+        self.health_cards["Health Status"].value_label.config(text=result.health_status)
+        self.health_cards["SMART Status"].value_label.config(text=result.smart_status)
+        self.health_cards["Windows Health"].value_label.config(text=result.windows_health_status)
+        self.health_cards["Temperature"].value_label.config(text=result.temperature)
+        self.health_cards["Wear / Age"].value_label.config(text=result.wear_age)
+        self.health_cards["Read Stability"].value_label.config(text=result.read_stability_status)
+        self.health_cards["Health Risk Score"].value_label.config(text=f"{result.health_risk_score} / 100")
+        risk_color = CYBER_RED if result.health_risk_score >= 75 else CYBER_ORANGE if result.health_risk_score >= 25 else CYBER_GREEN
+        self.health_cards["Health Risk Score"].value_label.config(fg=risk_color)
+        output = self.health_result_text(result)
+        self.set_text(self.health_output_text, output)
+        self.health_status_var.set(f"{result.health_status} - {result.recommendation}")
+        self.health_progress_var.set(100)
+        append_health_history(
+            {
+                "completed_at": result.completed_at or now_stamp(),
+                "target": result.target,
+                "health_status": result.health_status,
+                "health_risk_score": result.health_risk_score,
+                "recommendation": result.recommendation,
+                "smart_status": result.smart_status,
+                "windows_health_status": result.windows_health_status,
+                "read_stability_status": result.read_stability_status,
+                "report_html": result.report_html,
+                "report_txt": result.report_txt,
+            }
+        )
+        if hasattr(self, "history_text"):
+            self.refresh_history()
+        if hasattr(self, "health_history_text"):
+            self.refresh_health_history()
+
+    def health_result_text(self, result: HealthDiagnosticResult):
+        lines = [
+            f"Target: {result.target}",
+            f"Started: {result.started_at}",
+            f"Completed: {result.completed_at}",
+            f"Health Status: {result.health_status}",
+            f"Health Risk Score: {result.health_risk_score}/100",
+            f"Recommendation: {result.recommendation}",
+            f"SMART Selected Device: {result.smart_selected_device or 'Not matched'}",
+            f"SMART Match Confidence: {result.smart_match_confidence}",
+            f"SMART Match Reason: {result.smart_match_reason or 'N/A'}",
+            "",
+            "SMART Parsed Results",
+            "-" * 78,
+            json.dumps(result.smart_parsed, indent=2),
+            "",
+            "Windows Health Results",
+            "-" * 78,
+            json.dumps(result.windows_parsed, indent=2),
+            "",
+            "Surface Read Stability Results",
+            "-" * 78,
+            json.dumps(result.surface_results, indent=2),
+            "",
+            "Read-only CHKDSK Output",
+            "-" * 78,
+            result.chkdsk_output or "Not run.",
+            "",
+            "Health Findings",
+            "-" * 78,
+        ]
+        if result.issues:
+            for issue in result.issues:
+                lines.append(f"[{issue.get('severity')}] {issue.get('title')}: {issue.get('detail')}")
+        else:
+            lines.append("No health-specific findings recorded.")
+        return "\n".join(lines)
+
+    def health_html_report(self, result: HealthDiagnosticResult):
+        data = asdict(result)
+        issues = "".join(
+            f"<li><b>{html.escape(str(i.get('severity')))} - {html.escape(str(i.get('title')))}</b>: {html.escape(str(i.get('detail')))}</li>"
+            for i in result.issues
+        ) or "<li>No health-specific findings recorded.</li>"
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{APP_NAME} Health Report</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;background:#070B14;color:#F4FCFF;margin:24px;line-height:1.45}}
+h1,h2{{color:#00E5FF}} .panel{{background:#0B1220;border:1px solid #2C5E8F;padding:14px;margin:12px 0}}
+.metric{{display:inline-block;min-width:190px;background:#081526;border:1px solid #1B3355;padding:10px;margin:4px}}
+.risk{{color:#FFD166;font-weight:800}} pre{{white-space:pre-wrap;overflow-wrap:anywhere;color:#D7F7FF}}
+</style></head><body>
+<h1>{APP_NAME} Storage Health & Diagnostics</h1>
+<div class="panel"><div class="metric">Health<br><b>{html.escape(result.health_status)}</b></div>
+<div class="metric">SMART<br><b>{html.escape(result.smart_status)}</b></div>
+<div class="metric">Windows Health<br><b>{html.escape(result.windows_health_status)}</b></div>
+<div class="metric">Temperature<br><b>{html.escape(result.temperature)}</b></div>
+<div class="metric">Health Risk<br><b class="risk">{result.health_risk_score}/100</b></div>
+<p><b>Recommendation:</b> {html.escape(result.recommendation)}</p></div>
+<div class="panel"><h2>SMART Device Mapping</h2>
+<p><b>Selected smartctl device:</b> {html.escape(result.smart_selected_device or 'Not matched')}</p>
+<p><b>Match confidence:</b> {html.escape(result.smart_match_confidence)}</p>
+<p><b>Reason:</b> {html.escape(result.smart_match_reason or 'N/A')}</p></div>
+<div class="panel"><h2>Findings</h2><ul>{issues}</ul></div>
+<div class="panel"><h2>SMART Parsed Results</h2><pre>{html.escape(json.dumps(result.smart_parsed, indent=2))}</pre></div>
+<div class="panel"><h2>Windows Health Results</h2><pre>{html.escape(json.dumps(result.windows_parsed, indent=2))}</pre></div>
+<div class="panel"><h2>CHKDSK Output</h2><pre>{html.escape(result.chkdsk_output or 'Not run.')}</pre></div>
+<div class="panel"><h2>Surface Read Stability</h2><pre>{html.escape(json.dumps(result.surface_results, indent=2))}</pre></div>
+<div class="panel"><h2>Raw JSON</h2><pre>{html.escape(json.dumps(data, indent=2))}</pre></div>
+</body></html>"""
+
+    def drive_health_report_text(self, snapshots):
+        lines = [
+            f"{APP_NAME} - All Drive Health Dashboard Report",
+            f"Generated: {now_stamp()}",
+            f"Detected drives: {len(snapshots)}",
+            "",
+            "SAFETY NOTE",
+            "-" * 78,
+            "Diagnostics only. No repair, no formatting, no firmware operations, and no destructive disk actions were performed.",
+            "",
+        ]
+        for snapshot in snapshots:
+            lines.extend(
+                [
+                    "=" * 78,
+                    f"{snapshot.drive_letter} {snapshot.model}",
+                    "=" * 78,
+                    f"Root: {snapshot.root}",
+                    f"Volume Label: {snapshot.volume_label}",
+                    f"Manufacturer: {snapshot.manufacturer}",
+                    f"Serial: {snapshot.serial}",
+                    f"Firmware: {snapshot.firmware}",
+                    f"Capacity: {human_bytes(snapshot.capacity)}",
+                    f"Used: {human_bytes(snapshot.used)}",
+                    f"Free: {human_bytes(snapshot.free)}",
+                    f"Filesystem: {snapshot.filesystem}",
+                    f"Drive Type: {snapshot.drive_type}",
+                    f"Bus / Interface: {snapshot.bus_type}",
+                    f"Media Type: {snapshot.media_type}",
+                    f"Windows Health: {snapshot.windows_status}",
+                    f"SMART Health: {snapshot.smart_status}",
+                    f"SMART Device: {snapshot.smart_device or 'Not matched'}",
+                    f"SMART Match Confidence: {snapshot.smart_match_confidence}",
+                    f"Temperature: {snapshot.temperature}",
+                    f"Wear: {snapshot.wear}",
+                    f"Power-On Hours: {snapshot.power_on_hours}",
+                    f"Power Cycles: {snapshot.power_cycle_count}",
+                    f"Reallocated: {snapshot.reallocated}",
+                    f"Pending: {snapshot.pending}",
+                    f"Uncorrectable: {snapshot.uncorrectable}",
+                    f"CRC Errors: {snapshot.crc_errors}",
+                    f"NVMe Media/Data Integrity Errors: {snapshot.nvme_media_errors}",
+                    f"Health Score: {snapshot.health_score}/100",
+                    f"Status: {snapshot.health_status}",
+                    f"Recommendation: {snapshot.recommendation}",
+                    f"Last Checked: {snapshot.last_checked}",
+                    "",
+                    "Issues:",
+                ]
+            )
+            if snapshot.issues:
+                for issue in snapshot.issues:
+                    lines.append(f"- [{issue.get('severity')}] {issue.get('title')}: {issue.get('detail')}")
+            else:
+                lines.append("- No health-specific findings recorded.")
+            lines.extend(["", "SMART Parsed:", json.dumps(snapshot.smart_parsed, indent=2), "", "Windows Parsed:", json.dumps(snapshot.windows_parsed, indent=2), ""])
+        return "\n".join(lines)
+
+    def drive_health_html_report(self, snapshots):
+        cards = []
+        for snapshot in snapshots:
+            color = health_status_color(snapshot.health_status)
+            issues = "".join(
+                f"<li><b>{html.escape(str(i.get('severity')))} - {html.escape(str(i.get('title')))}</b>: {html.escape(str(i.get('detail')))}</li>"
+                for i in snapshot.issues
+            ) or "<li>No health-specific findings recorded.</li>"
+            cards.append(
+                f"""<div class="card" style="border-color:{color}">
+<div class="top"><h2>{html.escape(snapshot.drive_letter)} {html.escape(snapshot.model)}</h2><span style="background:{color}">{html.escape(snapshot.health_status)}</span></div>
+<p>{html.escape(snapshot.display_name)}</p>
+<div class="metrics">
+<div>Health Score<br><b style="color:{color}">{snapshot.health_score}/100</b></div>
+<div>Capacity<br><b>{html.escape(human_bytes(snapshot.capacity))}</b></div>
+<div>Free<br><b>{html.escape(human_bytes(snapshot.free))}</b></div>
+<div>Interface<br><b>{html.escape(snapshot.bus_type)}</b></div>
+<div>Media<br><b>{html.escape(snapshot.media_type)}</b></div>
+<div>SMART<br><b>{html.escape(snapshot.smart_status)}</b></div>
+<div>Temperature<br><b>{html.escape(snapshot.temperature)}</b></div>
+<div>Wear<br><b>{html.escape(snapshot.wear)}</b></div>
+</div>
+<p><b>Recommendation:</b> {html.escape(snapshot.recommendation)}</p>
+<h3>Identity</h3><pre>{html.escape(json.dumps({
+    "root": snapshot.root,
+    "volume_label": snapshot.volume_label,
+    "manufacturer": snapshot.manufacturer,
+    "serial": snapshot.serial,
+    "firmware": snapshot.firmware,
+    "filesystem": snapshot.filesystem,
+    "drive_type": snapshot.drive_type,
+    "smart_device": snapshot.smart_device,
+    "smart_match_confidence": snapshot.smart_match_confidence,
+    "smart_match_reason": snapshot.smart_match_reason,
+}, indent=2))}</pre>
+<h3>Findings</h3><ul>{issues}</ul>
+<h3>SMART Parsed Values</h3><pre>{html.escape(json.dumps(snapshot.smart_parsed, indent=2))}</pre>
+<h3>Windows Health Values</h3><pre>{html.escape(json.dumps(snapshot.windows_parsed, indent=2))}</pre>
+<h3>Raw SMART Preview</h3><pre>{html.escape(snapshot.raw_smart_preview or 'No raw SMART output available.')}</pre>
+</div>"""
+            )
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{APP_NAME} All Drive Health Report</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;background:#070B14;color:#F4FCFF;margin:24px;line-height:1.45}}
+h1{{color:#00E5FF}} h2,h3{{color:#D7F7FF}} .note{{background:#101826;border:1px solid #FFD166;padding:12px;margin:12px 0}}
+.card{{background:#0B1220;border:1px solid #2C5E8F;padding:14px;margin:14px 0}}
+.top{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .top span{{color:#fff;font-weight:800;padding:5px 10px}}
+.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0}}
+.metrics div{{background:#081526;border:1px solid #1B3355;padding:10px}} pre{{white-space:pre-wrap;overflow-wrap:anywhere;color:#D7F7FF}}
+</style></head><body>
+<h1>{APP_NAME} - Storage Health & Diagnostics Dashboard</h1>
+<div class="note">Generated {html.escape(now_stamp())}. Diagnostics only: no repair, no formatting, no firmware operations, and no destructive disk actions were performed.</div>
+{''.join(cards) if cards else '<p>No drive health snapshots were available.</p>'}
+</body></html>"""
+
+    def export_health_report(self):
+        snapshots = list(getattr(self, "drive_health_snapshots", []) or [])
+        if not self.last_health_result and not snapshots:
+            messagebox.showinfo("Health Report", "Run or refresh health diagnostics first.")
+            return
+        reports_dir = ensure_reports_dir()
+        if snapshots:
+            base = reports_dir / f"storage_health_all_drives_{file_stamp()}"
+            txt = base.with_suffix(".txt")
+            js = base.with_suffix(".json")
+            html_path = base.with_suffix(".html")
+            pdf_path = base.with_suffix(".pdf")
+            txt.write_text(self.drive_health_report_text(snapshots), encoding="utf-8")
+            js.write_text(json.dumps({"generated_at": now_stamp(), "drive_snapshots": [asdict(item) for item in snapshots]}, indent=2), encoding="utf-8")
+            html_content = self.drive_health_html_report(snapshots)
+            html_path.write_text(html_content, encoding="utf-8")
+            try:
+                from weasyprint import HTML
+                HTML(string=html_content, base_url=str(reports_dir)).write_pdf(str(pdf_path))
+            except Exception as exc:
+                logging.info("Health dashboard PDF export unavailable: %s", exc)
+            append_health_history(
+                {
+                    "completed_at": now_stamp(),
+                    "target": "All detected drives",
+                    "health_status": "Dashboard Export",
+                    "health_risk_score": min((100 - item.health_score for item in snapshots), default=0),
+                    "recommendation": f"{len(snapshots)} drive health snapshot(s) exported",
+                    "smart_status": "Per-drive",
+                    "windows_health_status": "Per-drive",
+                    "read_stability_status": "Not run",
+                    "report_html": str(html_path),
+                    "report_txt": str(txt),
+                }
+            )
+            if hasattr(self, "health_history_text"):
+                self.refresh_health_history()
+            self.open_file(str(html_path))
+            return
+
+        result = self.last_health_result
+        clean_root = result.target.replace("\\", "_").replace("/", "_").replace(":", "")
+        base = reports_dir / f"storage_health_{clean_root}_{file_stamp()}"
+        txt = base.with_suffix(".txt")
+        js = base.with_suffix(".json")
+        html_path = base.with_suffix(".html")
+        pdf_path = base.with_suffix(".pdf")
+        txt.write_text(self.health_result_text(result), encoding="utf-8")
+        js.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        html_content = self.health_html_report(result)
+        html_path.write_text(html_content, encoding="utf-8")
+        result.report_txt = str(txt)
+        result.report_json = str(js)
+        result.report_html = str(html_path)
+        try:
+            from weasyprint import HTML
+            HTML(string=html_content, base_url=str(reports_dir)).write_pdf(str(pdf_path))
+            result.report_pdf = str(pdf_path)
+        except Exception as exc:
+            logging.info("Health PDF export unavailable: %s", exc)
+        self.update_health_ui(result)
+        self.open_file(str(html_path))
+
     def bind_keyboard_shortcuts(self):
         shortcuts = {
             "<Control-o>": lambda _event: self.browse_path(),
@@ -3290,19 +6552,97 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         return handler
 
     def refresh_drives(self):
-        drives = get_windows_drives() or ["/"]
+        previous_root = self.get_selected_target_path() if hasattr(self, "drive_var") else ""
+        identities = discover_drive_identities_quick()
         if self.settings.exclude_system_drive and os.name == "nt":
-            drives = [d for d in drives if not d.upper().startswith("C:")] or drives
-        self.drive_combo["values"] = drives
-        if drives:
-            self.drive_combo.current(0)
-            self.cards["Selected Drive"].value_label.config(text=drives[0])
+            filtered = [item for item in identities if not item["root"].upper().startswith("C:")]
+            identities = filtered or identities
+        self.apply_drive_identities(identities, previous_root)
+        self.update_drive_details_panel()
+        self.start_drive_enrichment(previous_root)
+
+    def start_drive_enrichment(self, previous_root):
+        if self.drive_refresh_thread and self.drive_refresh_thread.is_alive():
+            return
+        self.drive_refresh_generation += 1
+        generation = self.drive_refresh_generation
+        if hasattr(self, "drive_details_var"):
+            self.drive_details_var.set(self.drive_details_var.get() + "\n\nLoading physical disk identity in background...")
+
+        def worker():
+            try:
+                identities = discover_drive_identities()
+                self.drive_refresh_queue.put({"generation": generation, "identities": identities, "previous_root": previous_root})
+            except Exception as exc:
+                self.drive_refresh_queue.put({"generation": generation, "error": str(exc), "previous_root": previous_root})
+
+        self.drive_refresh_thread = threading.Thread(target=worker, daemon=True)
+        self.drive_refresh_thread.start()
+
+    def apply_drive_identities(self, identities, previous_root=""):
+        if self.settings.exclude_system_drive and os.name == "nt":
+            filtered = [item for item in identities if not item["root"].upper().startswith("C:")]
+            identities = filtered or identities
+        self.drive_display_map = {item["display"]: item["root"] for item in identities}
+        self.drive_identity_map = {item["display"]: item for item in identities}
+        displays = [item["display"] for item in identities]
+        self.drive_combo["values"] = displays
+        selected_display = ""
+        previous_root = previous_root or self.get_selected_target_path()
+        if previous_root:
+            for item in identities:
+                if normalize_drive_root(item["root"]).lower() == normalize_drive_root(previous_root).lower():
+                    selected_display = item["display"]
+                    break
+        if not selected_display and displays:
+            selected_display = displays[0]
+        if selected_display:
+            self.drive_var.set(selected_display)
+            self.cards["Selected Drive"].value_label.config(text=self.drive_display_map.get(selected_display, selected_display))
 
     def browse_path(self):
         path = filedialog.askdirectory(title="Select Target Drive or Folder")
         if path:
             self.drive_var.set(path)
             self.cards["Selected Drive"].value_label.config(text=path)
+            self.update_drive_details_panel()
+
+    def get_selected_target_path(self):
+        selected = self.drive_var.get() if hasattr(self, "drive_var") else ""
+        return self.drive_display_map.get(selected, selected)
+
+    def update_drive_details_panel(self):
+        if not hasattr(self, "drive_details_var"):
+            return
+        selected = self.drive_var.get()
+        root = self.drive_display_map.get(selected, selected)
+        item = self.drive_identity_map.get(selected)
+        if not root:
+            self.drive_details_var.set("No target selected.")
+            return
+        if item:
+            meta = item.get("metadata") or {}
+            vol = item.get("volume_info") or {}
+            usage = item.get("usage") or {}
+            lines = [
+                f"Root: {item.get('root', root)}",
+                f"Volume: {vol.get('volume_name', 'Unknown')} | File System: {vol.get('filesystem', 'Unknown')}",
+                f"Capacity: {human_bytes(usage.get('total', 0))} | Free: {human_bytes(usage.get('free', 0))} | Used: {human_bytes(usage.get('used', 0))}",
+                f"Drive Type: {item.get('drive_type', 'Unknown')} | Badge: {item.get('badge', 'Unknown')}",
+                f"Model/FriendlyName: {meta.get('PhysicalFriendlyName') or meta.get('FriendlyName') or meta.get('Model') or 'Unknown'}",
+                f"Serial: {meta.get('SerialNumber') or meta.get('PhysicalSerialNumber') or 'Unknown'} | Bus: {meta.get('BusType') or meta.get('PhysicalBusType') or 'Unknown'} | Media: {meta.get('PhysicalMediaType') or meta.get('MediaType') or 'Unknown'}",
+                f"Health: {meta.get('HealthStatus') or meta.get('PhysicalHealthStatus') or 'Unknown'} | Operational: {meta.get('OperationalStatus') or meta.get('PhysicalOperationalStatus') or 'Unknown'}",
+            ]
+            if item.get("warning"):
+                lines.append(f"Metadata Note: {item.get('warning')}")
+            self.drive_details_var.set("\n".join(lines))
+        else:
+            try:
+                usage = shutil.disk_usage(root)
+                details = f"Custom Path: {root}\nCapacity: {human_bytes(usage.total)} | Free: {human_bytes(usage.free)} | Used: {human_bytes(usage.used)}\nDrive metadata is shown for discovered drive roots only."
+            except Exception as exc:
+                details = f"Custom Path: {root}\nDrive details unavailable: {exc}"
+            self.drive_details_var.set(details)
 
     def validate_inputs(self, target):
         if not target:
@@ -3321,7 +6661,7 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         return True
 
     def start_scan(self, resume_session=None):
-        target = self.drive_var.get()
+        target = self.get_selected_target_path()
         if not self.validate_inputs(target):
             return
         if self.scan_thread and self.scan_thread.is_alive():
@@ -3616,6 +6956,54 @@ li{{margin:7px 0}} code{{color:#39FF88}}
                 self.update_live_findings_from_metrics(metrics)
         except queue.Empty:
             pass
+        try:
+            while True:
+                item = self.health_queue.get_nowait()
+                kind = item.get("type")
+                if kind == "status":
+                    self.health_status_var.set(item.get("message", "Diagnostics running..."))
+                elif kind == "progress":
+                    try:
+                        self.health_progress_var.set(float(item.get("value", 0)))
+                    except Exception:
+                        pass
+                elif kind == "log":
+                    message = str(item.get("message", ""))
+                    self.append_text(self.health_output_text, message + "\n")
+                    logging.info(message)
+                elif kind == "complete":
+                    self.update_health_ui(item.get("result"))
+                    self.refresh_open_drive_detail_windows()
+                    self.log_callback("Storage health diagnostics completed.")
+                elif kind == "drive_health_complete":
+                    self.update_drive_health_dashboard(item.get("snapshots", []))
+                    self.log_callback("Storage health dashboard refreshed.")
+                elif kind == "drive_health_partial":
+                    self.merge_drive_health_snapshots(item.get("snapshots", []))
+                    self.log_callback("Selected drive health snapshot refreshed.")
+                elif kind == "drive_health_error":
+                    message = item.get("message", "Unknown dashboard error")
+                    if hasattr(self, "drive_health_status_var"):
+                        self.drive_health_status_var.set(f"Drive health refresh failed: {message}")
+                    self.append_text(self.health_output_text, f"[Health/Dashboard] {message}\n")
+                    self.drive_health_loading = False
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                item = self.drive_refresh_queue.get_nowait()
+                if item.get("generation") != self.drive_refresh_generation:
+                    continue
+                if item.get("error"):
+                    if hasattr(self, "drive_details_var"):
+                        self.drive_details_var.set(self.drive_details_var.get() + f"\n\nMetadata refresh note: {item.get('error')}")
+                    continue
+                current_root = self.get_selected_target_path()
+                self.apply_drive_identities(item.get("identities", []), current_root or item.get("previous_root", ""))
+                self.update_drive_details_panel()
+                self.log_callback("Drive identity metadata refreshed.")
+        except queue.Empty:
+            pass
         self.after(100, self.process_queues)
 
     def apply_settings(self):
@@ -3624,16 +7012,21 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         self.settings.delayed_verify_seconds = max(0, safe_int(self.setting_vars.get("delayed_verify_seconds", tk.StringVar(value="0")).get(), 0))
         self.settings.random_recheck_percent = max(0, min(100, safe_int(self.setting_vars.get("random_recheck_percent", tk.StringVar(value="8")).get(), 8)))
         self.settings.severe_corruption_blocks = max(1, safe_int(self.setting_vars.get("severe_corruption_blocks", tk.StringVar(value="100")).get(), 100))
+        self.settings.surface_scan_max_mb = max(16, safe_int(self.setting_vars.get("surface_scan_max_mb", tk.StringVar(value="512")).get(), 512))
+        self.settings.surface_scan_chunk_mb = max(1, min(128, safe_int(self.setting_vars.get("surface_scan_chunk_mb", tk.StringVar(value="4")).get(), 4)))
+        self.settings.surface_scan_max_seconds = max(10, safe_int(self.setting_vars.get("surface_scan_max_seconds", tk.StringVar(value="180")).get(), 180))
         self.settings.enable_smart_checks = self.smart_var.get()
         self.settings.enable_powershell_metadata = self.ps_var.get()
         self.settings.exclude_system_drive = self.exclude_c_var.get()
         self.settings.show_advanced_warnings = self.warn_var.get()
         self.settings.auto_stop_severe_corruption = self.auto_stop_corruption_var.get()
+        self.save_app_settings()
+        self.log_callback("Settings applied and saved.")
 
     def discover_sessions(self):
         sessions = []
         roots = get_windows_drives() if os.name == "nt" else ["/"]
-        target = self.drive_var.get()
+        target = self.get_selected_target_path()
         if target:
             roots.insert(0, target)
         seen = set()
@@ -3664,7 +7057,22 @@ li{{margin:7px 0}} code{{color:#39FF88}}
 
     def refresh_history(self):
         entries = load_history()
+        health_entries = load_health_history()
         lines = []
+        if health_entries:
+            lines.append("STORAGE HEALTH & DIAGNOSTICS HISTORY")
+            lines.append("=" * 78)
+            for item in health_entries[:40]:
+                lines.append(
+                    f"{item.get('completed_at')} | {item.get('health_status')} | "
+                    f"Health Risk {item.get('health_risk_score')} | {item.get('target')}"
+                )
+                lines.append(f"  Recommendation: {item.get('recommendation')}")
+                if item.get("report_html"):
+                    lines.append(f"  Health Report: {item.get('report_html')}")
+                lines.append("")
+            lines.append("SCAN HISTORY")
+            lines.append("=" * 78)
         for item in entries[:80]:
             lines.append(f"{item.get('completed_at')} | {item.get('status')} | Risk {item.get('risk_score')} | {item.get('target')}")
             lines.append(f"  Mode: {item.get('scan_mode')} | Test: {item.get('test_size')}")
@@ -3672,7 +7080,26 @@ li{{margin:7px 0}} code{{color:#39FF88}}
             if item.get("pdf_report_path"):
                 lines.append(f"  PDF: {item.get('pdf_report_path')}")
             lines.append("")
-        self.set_text(self.history_text, "\n".join(lines) if lines else "No completed scan history yet.\n")
+        self.set_text(self.history_text, "\n".join(lines) if lines else "No completed scan or health history yet.\n")
+
+    def refresh_health_history(self):
+        entries = load_health_history()
+        lines = ["STORAGE HEALTH & DIAGNOSTICS HISTORY", "=" * 78, ""]
+        for item in entries[:120]:
+            lines.append(
+                f"{item.get('completed_at')} | {item.get('health_status')} | "
+                f"Health Risk {item.get('health_risk_score')} | {item.get('target')}"
+            )
+            lines.append(f"  Recommendation: {item.get('recommendation')}")
+            lines.append(f"  SMART: {item.get('smart_status')}")
+            lines.append(f"  Windows: {item.get('windows_health_status')}")
+            lines.append(f"  Read Stability: {item.get('read_stability_status')}")
+            if item.get("report_html"):
+                lines.append(f"  HTML Report: {item.get('report_html')}")
+            if item.get("report_txt"):
+                lines.append(f"  TXT Report: {item.get('report_txt')}")
+            lines.append("")
+        self.set_text(self.health_history_text, "\n".join(lines) if entries else "No storage health diagnostics history yet.\n")
 
     def discard_selected_session(self):
         selected = self.session_var.get()
@@ -3704,6 +7131,8 @@ li{{margin:7px 0}} code{{color:#39FF88}}
                 return
             if self.scanner:
                 self.scanner.cancel()
+        if self.health_thread and self.health_thread.is_alive() and self.health_runner:
+            self.health_runner.cancel()
         self.destroy()
 
 
