@@ -51,9 +51,6 @@ The tool never writes directly to raw disks or partitions.
 #*New Feature 26/05/2026*
 <img width="1876" height="801" alt="image" src="https://github.com/user-attachments/assets/b85488a6-04a1-4e5d-869a-06d7b037f71e" />
 
-#*Latest Build*#
-https://drive.google.com/file/d/1uwJeVAp-hiUmIVK9FYuSUE0tBVIJ1zQL/view?usp=drive_link
-
 # Latest Improvements — v2.1 (26/05/2026)
 
 The latest v2.1 update significantly expands Cyber Storage Verifier into a full enterprise-style storage health diagnostics and forensic telemetry platform while preserving the original counterfeit-capacity verification engine, resumable block-validation architecture, and SHA-256 integrity verification system.
