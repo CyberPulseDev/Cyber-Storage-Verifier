@@ -45,9 +45,11 @@ The tool never writes directly to raw disks or partitions.
 <img width="1361" height="856" alt="Screenshot 2026-05-23 205437" src="https://github.com/user-attachments/assets/52454496-a9da-49a5-98c7-bf631fceb2ab" />
 <img width="1356" height="858" alt="Screenshot 2026-05-23 205441" src="https://github.com/user-attachments/assets/7246fd45-52aa-4fc1-87d9-627678da98e8" />
 
-#*New UI Update*
+#*New UI Update 25/05/2026*
 <img width="1918" height="986" alt="image" src="https://github.com/user-attachments/assets/dcabb658-0741-432b-9db1-bda6281568bb" />
 
+#"New Feature 26/05/2026"
+<img width="1876" height="801" alt="image" src="https://github.com/user-attachments/assets/b85488a6-04a1-4e5d-869a-06d7b037f71e" />
 
 # Latest Improvements — v2.1 (26/05/2026)
 
