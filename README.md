@@ -49,99 +49,193 @@ The tool never writes directly to raw disks or partitions.
 <img width="1918" height="986" alt="image" src="https://github.com/user-attachments/assets/dcabb658-0741-432b-9db1-bda6281568bb" />
 
 
-# Latest Improvements — 24/05/2026
+# Latest Improvements — v2.1 (26/05/2026)
 
-The latest update significantly improves forensic telemetry synchronization, corruption analytics, resumable recovery, evidence preservation, report rendering, and PDF export support while preserving the original integrity validation engine and scan architecture.
+The latest v2.1 update significantly expands Cyber Storage Verifier into a full enterprise-style storage health diagnostics and forensic telemetry platform while preserving the original counterfeit-capacity verification engine, resumable block-validation architecture, and SHA-256 integrity verification system.
 
-## Added Advanced Forensic Reporting System
+The update introduces advanced live storage-health monitoring, SMART diagnostics, responsive cyber-themed drive dashboards, forensic telemetry visualization, full-device diagnostics windows, improved corruption analytics, intelligent health-risk scoring, enhanced export/report systems, and significantly improved UI responsiveness.
 
-- Fully redesigned cyber-forensic HTML dashboard reports
-- Professional evidence presentation layout
-- Storage authenticity visualization maps
-- Verified/corrupted/failed range visualization
-- SHA-256 mismatch evidence tables
-- Corruption timeline analytics
-- Risk indicator widgets
-- Final warning evidence panels
-- Visual corruption telemetry dashboards
-- Added PDF forensic report exporting
-- Improved non-technical readability
-- Improved evidence presentation for dispute/report submissions
+---
 
-## Added & Improved
+## Added Storage Health & Diagnostics Dashboard
 
-### Live Telemetry Improvements
+- Added advanced Storage Health & Diagnostics dashboard
+- Added automatic multi-drive discovery and live telemetry rendering
+- Added enterprise-style cyber-themed drive health cards
+- Added responsive drive-card rendering and adaptive dashboard scaling
+- Added automatic SSD/HDD/NVMe/USB/removable-media classification
+- Added intelligent drive identity detection:
+  - Model
+  - Manufacturer
+  - Firmware
+  - Serial number
+  - Filesystem
+  - Bus/interface type
+  - Media type
+  - Capacity metadata
+- Added enterprise-style health summary telemetry widgets
+- Added live drive health score visualization
+- Added dynamic status badges:
+  - GOOD
+  - WARNING
+  - CRITICAL
+  - UNKNOWN
 
-- Real-time recalculation of:
-  - Processed blocks
-  - Verified blocks
-  - Corrupted blocks
-  - Failed blocks
-  - Read failures
-  - Coverage percentage
-  - Current scan phase
-  - Current block tracking
-  - Estimated authentic capacity
+---
 
-### Verification Improvements
+## Added Advanced SMART Diagnostics Engine
 
-- Processed progress now advances even during corruption
-- Verified capacity counts only SHA-256 validated blocks
-- Separate tracking for:
-  - Verified data
-  - Corrupted data
-  - Failed data
-  - Processed data
+- Added automatic smartctl discovery
+- Added Windows-to-SMART device matching intelligence
+- Added SMART confidence scoring
+- Added advanced SMART parsing engine
+- Added SMART telemetry synchronization
+- Added raw SMART output inspection
+- Added read-only hardware diagnostics architecture
+- Added support for:
+  - Reallocated sectors
+  - Pending sectors
+  - Offline uncorrectable sectors
+  - CRC errors
+  - Temperature telemetry
+  - Power-on hours
+  - Power-cycle counts
+  - NVMe media integrity errors
+  - SSD wear-level telemetry
+  - Available spare analysis
+  - Unsafe shutdown tracking
+  - Host read/write telemetry
 
-### Partial Scan Finalization
+---
 
-- Reports now generate even if scans are interrupted through:
-  - Stop Scan
-  - Cancel
-  - Emergency Stop
-  - Severe corruption auto-stop
+## Added Intelligent Device-Aware Telemetry
 
-- Interrupted reports are clearly marked:
-  - `SCAN INTERRUPTED - PARTIAL RESULTS`
+- Added SSD/NVMe wear-level analysis
+- Added HDD-specific mechanical-drive interpretation
+- Added intelligent fallback wording:
+  - Mechanical HDD
+  - Not Exposed
+  - SMART Unavailable
+  - USB Bridge Hidden
+  - Not Reported
+- Added USB/removable-device SMART fallback handling
+- Added NVMe Percentage Used telemetry support
+- Added Wear_Leveling_Count support
+- Added Media_Wearout_Indicator support
+- Added Percent_Lifetime_Remain support
 
-### Advanced Corruption Intelligence
+---
 
-- First corruption block detection
-- Corruption percentage analytics
-- Consecutive corruption tracking
-- Corruption start offset detection
-- Estimated authentic usable capacity
-- SHA-256 mismatch evidence generation
-- Verified/corrupted/failed range mapping
-- Fake-capacity boundary detection
+## Added Full Drive Diagnostics Window
 
-### Reporting Engine Enhancements
+- Added complete "View Full Details" diagnostics viewer
+- Added responsive Toplevel forensic diagnostics window
+- Added tabbed diagnostics interface:
+  - Overview
+  - SMART Details
+  - Health Analysis
+  - Surface Stability
+  - Raw SMART Output
+  - History / Timeline
+- Added SMART attribute tables
+- Added raw SMART telemetry viewer
+- Added forensic telemetry history rendering
+- Added drive-specific recommendation engine
+- Added single-drive TXT/JSON/HTML/PDF forensic report exporting
 
-- TXT / JSON / CSV / HTML / PDF support
-- Corruption timeline visualization
-- SMART summaries
-- Device metadata
-- Interruption reasons
-- Verified and failed range reporting
-- Storage authenticity visualization
-- Risk indicator dashboards
+---
 
-### UI Improvements
+## Added Surface Stability & Read-Only Diagnostics
 
-- Advanced forensic dashboard design
-- Improved telemetry widgets
-- Warning banners
-- Corruption visualization
-- Stabilized ETA calculations
-- Live findings updates
-- Improved forensic evidence readability
+- Added read-only surface read stability analysis
+- Added latency anomaly detection
+- Added weak-region and slow-region detection
+- Added sampled read-stability scoring
+- Added timeout intelligence
+- Added read-only CHKDSK preview support
+- Added safer diagnostics-only execution model
+- Explicitly prevents:
+  - Raw disk writes
+  - Formatting
+  - Repair-volume operations
+  - Firmware modification
+  - Bad-sector repair execution
 
-### Resume Engine Improvements
+---
 
-- Enhanced checkpoint synchronization
-- Improved finalize() handling
-- Better interrupted-session recovery
-- Improved corruption persistence tracking
+## Added Advanced Health Risk Intelligence
+
+- Added predictive health-risk scoring engine
+- Added SMART degradation analysis
+- Added thermal-risk detection
+- Added SSD wear-risk analysis
+- Added CRC instability intelligence
+- Added media/data integrity risk analysis
+- Added contextual recommendations:
+  - Backup recommended
+  - Replacement recommended
+  - Monitor this device
+  - Mechanical HDD operating normally
+  - SSD wear remains within normal range
+
+---
+
+## Added Responsive UI Improvements
+
+- Added fully responsive Health Diagnostics dashboard layout
+- Added adaptive drive-card scaling
+- Added compact-window optimization
+- Added automatic stacked-layout behavior
+- Added dynamic resizing logic
+- Added scrollable diagnostics containers
+- Added improved telemetry readability
+- Added improved cyber-style dashboard rendering
+
+---
+
+## Added Enhanced Reporting & Exporting
+
+- Added enhanced forensic storage-health reporting
+- Added SMART evidence rendering
+- Added interruption-aware forensic exports
+- Added advanced telemetry visualization panels
+- Added improved PDF forensic export support
+- Added enhanced HTML forensic dashboards
+- Added drive-specific forensic export support
+- Added improved forensic evidence readability
+- Added improved non-technical report presentation
+
+---
+
+## Added Testing & Reliability Improvements
+
+- Added extensive health diagnostics unit testing
+- Added SMART parser validation tests
+- Added HDD/NVMe telemetry rendering verification
+- Added uncertain SMART mapping validation
+- Added full-details-window testing
+- Added export validation testing
+- Added device-aware fallback handling tests
+- Improved metadata caching reliability
+- Improved PowerShell integration stability
+- Improved diagnostics responsiveness
+- Improved smartctl matching accuracy
+- Improved overall application stability
+
+---
+
+## Existing Core Features Preserved
+
+- Counterfeit-capacity detection
+- SHA-256 integrity validation
+- Resumable block verification
+- Session checkpointing
+- Corruption intelligence engine
+- Fake-capacity boundary analysis
+- Forensic evidence tracking
+- Multi-format forensic reporting
+- Scan history and recovery systems
+- Cyber-themed Tkinter dashboard architecture
 
 # Requirements
 
