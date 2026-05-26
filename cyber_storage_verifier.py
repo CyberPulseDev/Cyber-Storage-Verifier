@@ -119,13 +119,43 @@ def writable_reports_root() -> Path:
     return Path.home() / "Documents" / REPORT_DIR_NAME
 
 
+def app_icon_path() -> str:
+    candidates = [
+        resource_path("assets/app.ico"),
+        resource_path("assets/ico.ico"),
+        resource_path("app.ico"),
+        resource_path("ico.ico"),
+        str(app_base_dir() / "assets" / "app.ico"),
+        str(app_base_dir() / "assets" / "ico.ico"),
+        str(app_base_dir() / "app.ico"),
+        str(app_base_dir() / "ico.ico"),
+    ]
+    for candidate in candidates:
+        try:
+            if Path(candidate).is_file():
+                return str(Path(candidate))
+        except Exception:
+            continue
+    return candidates[0]
+
+
+def set_windows_app_user_model_id():
+    if os.name != "nt":
+        return
+    try:
+        app_id = f"Rushab.CyberStorageVerifier.{APP_VERSION}"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
 def app_cache_dir() -> Path:
     cache = ensure_reports_dir() / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 
 
-APP_ICON_PATH = resource_path("assets/app.ico")
+APP_ICON_PATH = app_icon_path()
 HISTORY_FILE = writable_reports_root() / "scan_history.json"
 SETTINGS_FILE = writable_reports_root() / "app_settings.json"
 
@@ -3264,6 +3294,7 @@ ul {{ margin:0; padding-left:18px; }} li {{ margin:7px 0; }} li span {{ display:
 
 class CyberStorageVerifierApp(tk.Tk):
     def __init__(self):
+        set_windows_app_user_model_id()
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
         self.geometry("1360x860")
@@ -3351,7 +3382,8 @@ class CyberStorageVerifierApp(tk.Tk):
         try:
             icon_path = Path(APP_ICON_PATH)
             if icon_path.is_file():
-                self.iconbitmap(str(icon_path))
+                self.iconbitmap(default=str(icon_path))
+                self.wm_iconbitmap(str(icon_path))
                 logging.info("Application icon loaded from %s", icon_path)
             else:
                 logging.info("Application icon not found at %s", icon_path)
@@ -5576,7 +5608,8 @@ li{{margin:7px 0}} code{{color:#39FF88}}
         try:
             icon_path = Path(APP_ICON_PATH)
             if icon_path.is_file():
-                win.iconbitmap(str(icon_path))
+                win.iconbitmap(default=str(icon_path))
+                win.wm_iconbitmap(str(icon_path))
         except Exception:
             pass
         self.center_toplevel(win, 1200, 800)
@@ -7137,5 +7170,6 @@ h1{{color:#00E5FF}} h2,h3{{color:#D7F7FF}} .note{{background:#101826;border:1px 
 
 
 if __name__ == "__main__":
+    set_windows_app_user_model_id()
     app = CyberStorageVerifierApp()
     app.mainloop()
