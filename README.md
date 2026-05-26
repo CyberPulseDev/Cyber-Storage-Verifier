@@ -375,7 +375,7 @@ python, tkinter, cybersecurity, storage, usb, ssd, hdd, sd-card, fake-capacity, 
 ```
 ## Automated Diagnostics Testing
 
-Cyber Storage Verifier includes an automated diagnostics validation suite that verifies critical forensic, SMART, telemetry, reporting, and health-analysis functionality during development and release testing.
+Cyber Storage Verifier includes an automated diagnostics validation suite used to verify critical forensic, SMART, telemetry, reporting, and health-analysis functionality during development and release testing.
 
 The test suite validates:
 
@@ -392,19 +392,39 @@ The test suite validates:
 - Corruption telemetry integrity
 - Report generation stability
 
-Run the diagnostics tests:
+### Important
+
+`test_health_diagnostics.py` currently expects:
+
+```text
+Cyber Storage Verifier.py
+```
+
+to exist in the same directory as the test file.
+
+Example structure:
+
+```text
+Cyber Storage Verifier/
+├── Cyber Storage Verifier.py
+├── test_health_diagnostics.py
+```
+
+### Run Diagnostics Tests
+
+Run directly:
 
 ```bash
-python tests/test_health_diagnostics.py
+python test_health_diagnostics.py
 ```
 
 Or with pytest:
 
 ```bash
-pytest tests/
+pytest
 ```
 
-The automated tests are intended for development and release validation and are not required for normal application usage.
+The automated diagnostics tests are intended for development and release validation only and are not required for normal application usage.
 
 ## Disclaimer
 
