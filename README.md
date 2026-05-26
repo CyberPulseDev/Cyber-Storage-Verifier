@@ -373,6 +373,38 @@ The executable will be created in the `dist` folder.
 ```text
 python, tkinter, cybersecurity, storage, usb, ssd, hdd, sd-card, fake-capacity, integrity-checker, windows
 ```
+## Automated Diagnostics Testing
+
+Cyber Storage Verifier includes an automated diagnostics validation suite that verifies critical forensic, SMART, telemetry, reporting, and health-analysis functionality during development and release testing.
+
+The test suite validates:
+
+- SMART parser reliability
+- HDD / SSD / NVMe telemetry rendering
+- Wear-level and temperature fallback handling
+- USB bridge SMART fallback behavior
+- Health risk scoring logic
+- SMART-device confidence matching
+- Surface stability analysis fallbacks
+- Full diagnostics window behavior
+- Single-drive forensic export generation
+- History/timeline rendering
+- Corruption telemetry integrity
+- Report generation stability
+
+Run the diagnostics tests:
+
+```bash
+python tests/test_health_diagnostics.py
+```
+
+Or with pytest:
+
+```bash
+pytest tests/
+```
+
+The automated tests are intended for development and release validation and are not required for normal application usage.
 
 ## Disclaimer
 
