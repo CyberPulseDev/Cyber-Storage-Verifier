@@ -48,8 +48,11 @@ The tool never writes directly to raw disks or partitions.
 #*New UI Update 25/05/2026*
 <img width="1918" height="986" alt="image" src="https://github.com/user-attachments/assets/dcabb658-0741-432b-9db1-bda6281568bb" />
 
-#"New Feature 26/05/2026"
+#*New Feature 26/05/2026*
 <img width="1876" height="801" alt="image" src="https://github.com/user-attachments/assets/b85488a6-04a1-4e5d-869a-06d7b037f71e" />
+
+#*Latest Build*#
+https://drive.google.com/file/d/1uwJeVAp-hiUmIVK9FYuSUE0tBVIJ1zQL/view?usp=drive_link
 
 # Latest Improvements — v2.1 (26/05/2026)
 
